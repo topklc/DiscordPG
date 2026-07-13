@@ -2,14 +2,15 @@
  * @name DiscordPG
  * @author topklc
  * @authorId 0
- * @version 1.7.4
+ * @version 1.8.0
  * @description End-to-end PGP encryption for Discord messages using OpenPGP.js. Generate/import keys, encrypt to your contacts, and auto-decrypt incoming PGP blocks inline. Use "/pgp on" or "/pgp off" in a channel to toggle encryption.
- * @website https://github.com/
- * @source https://github.com/
+ * @website https://github.com/topklc/DiscordPG
+ * @source https://github.com/topklc/DiscordPG/blob/main/DiscordPG.plugin.js
+ * @updateUrl https://raw.githubusercontent.com/topklc/DiscordPG/main/DiscordPG.plugin.js
  */
 
 /*
- * SECURITY NOTES — read before trusting this with anything serious:
+ * SECURITY NOTES: read before trusting this with anything serious:
  *  - Your private key and passphrase are stored in plaintext in the BetterDiscord
  *    data folder. Anyone with access to your machine/profile can read them.
  *  - Discord message content is limited to 2000 characters. PGP ciphertext is large,
@@ -22,7 +23,7 @@ module.exports = (() => {
 
     const config = {
         name: "DiscordPG",
-        version: "1.7.4",
+        version: "1.8.0",
         author: "topklc",
     };
 
@@ -37,14 +38,15 @@ module.exports = (() => {
         privateKey: "",
         publicKey: "",
         passphrase: "",
-        contacts: {},          // { [userId]: { label, publicKey } }
+        revocationCertificate: "", // armored cert to publish if this key is compromised
+        contacts: {},          // { [userId]: { label, publicKey, revoked? } }
         enabledChannels: {},   // { [channelId]: true }
         signMessages: true,
         autoDecrypt: true,
         minimalBadges: false,  // plain 🔓/🔒/🔑 on messages instead of the colored PGP tag
         richContent: false,    // master opt-in: render emojis/links/media in decrypted messages
-        renderEmojis: true,    // custom Discord emoji (loads from Discord's CDN) — needs richContent
-        autoLoadMedia: false,  // auto-fetch image/GIF links (leaks IP to host!) — needs richContent
+        renderEmojis: true,    // custom Discord emoji (loads from Discord's CDN); needs richContent
+        autoLoadMedia: false,  // auto-fetch image/GIF links (leaks IP to host!); needs richContent
     };
 
     class DiscordPG {
@@ -134,7 +136,7 @@ module.exports = (() => {
                 // The self-contained browser build leaves its API in a module-local
                 // `var openpgp` that never reaches module.exports when require()'d.
                 // Append an export line so a real CommonJS loader can pick it up.
-                // Best-effort only — the evaluation fallback below doesn't need it,
+                // Best-effort only; the evaluation fallback below doesn't need it,
                 // and some fs shims lack appendFileSync.
                 try {
                     fs.appendFileSync(
@@ -146,7 +148,7 @@ module.exports = (() => {
             let openpgp = null;
 
             // Attempt 1: CommonJS require (works when a real Node loader is present).
-            // BetterDiscord's require shim can't load arbitrary files — it may return
+            // BetterDiscord's require shim can't load arbitrary files, so it may return
             // an empty object or throw, so treat failure as non-fatal.
             try {
                 if (require.cache && require.resolve) delete require.cache[require.resolve(libPath)];
@@ -180,7 +182,7 @@ module.exports = (() => {
         async _fetchBuffer(url) {
             const errors = [];
 
-            // 1) BetterDiscord's own networking — Node-backed, bypasses Discord's CSP.
+            // 1) BetterDiscord's own networking: Node-backed, bypasses Discord's CSP.
             try {
                 if (BdApi.Net && typeof BdApi.Net.fetch === "function") {
                     const res = await BdApi.Net.fetch(url, { redirect: "follow" });
@@ -255,12 +257,12 @@ module.exports = (() => {
                     // heals their stored ID, so DMs work without a manual ID.
                     const rid = this._resolveContactId(id);
                     const c = rid && this.settings.contacts[rid];
-                    return c && c.publicKey;
+                    return c && !c.revoked && c.publicKey; // never encrypt to a revoked key
                 })
                 .filter(Boolean);
             // Fallback (e.g. guild channels have no recipients list): encrypt to every known contact.
             if (!keys.length) {
-                keys = Object.values(this.settings.contacts).map((c) => c.publicKey).filter(Boolean);
+                keys = Object.values(this.settings.contacts).filter((c) => !c.revoked && c.publicKey).map((c) => c.publicKey);
             }
             return keys;
         }
@@ -269,11 +271,11 @@ module.exports = (() => {
             // @mention targeting: if the message mentions users, encrypt ONLY to
             // those users' saved keys (plus yourself), overriding the channel's
             // normal recipient selection. Two forms are recognised:
-            //   1. real Discord mentions — raw content contains <@id> / <@!id>
+            //   1. real Discord mentions: raw content contains <@id> / <@!id>
             //   2. plain-text "@label" matching a saved contact's label, for when
             //      Discord doesn't convert the @ (no autocomplete pick, DMs, etc.)
             const rawMentionIds = [...new Set([...text.matchAll(/<@!?(\d+)>/g)].map((m) => m[1]))];
-            // Real mentions must all resolve to saved keys — fail closed, the
+            // Real mentions must all resolve to saved keys (fail closed): the
             // user explicitly targeted people. _resolveContactId also matches by
             // username and self-heals contacts saved with a wrong User ID.
             const mentionIds = [];
@@ -288,13 +290,20 @@ module.exports = (() => {
                     + ". Check the contact's User ID / label in settings.");
             }
             for (const [id, c] of Object.entries(this.settings.contacts)) {
-                if (!c.label || !c.publicKey || mentionIds.includes(id)) continue;
+                if (!c.label || !c.publicKey || c.revoked || mentionIds.includes(id)) continue;
                 const esc = c.label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
                 // "@label" not immediately preceded/followed by a word character,
                 // so "me@bobmail.com" doesn't target the contact "bob".
                 if (new RegExp("(^|[^a-z0-9_])@" + esc + "(?![a-z0-9_])", "i").test(text)) {
                     mentionIds.push(id);
                 }
+            }
+            // Fail closed on explicitly targeted contacts whose key is revoked.
+            const revokedTargets = mentionIds.filter((id) => this.settings.contacts[id] && this.settings.contacts[id].revoked);
+            if (revokedTargets.length) {
+                throw new Error("Key revoked for: "
+                    + revokedTargets.map((id) => this.settings.contacts[id].label || id).join(", ")
+                    + ". Ask them for a new key.");
             }
             let armoredRecips;
             if (mentionIds.length) {
@@ -330,6 +339,64 @@ module.exports = (() => {
             return data;
         }
 
+        // ---------- revocation ----------
+        // Return an armored revocation artifact for our own key, generating and
+        // caching one if we don't have it yet. Newly generated keys already carry
+        // a detached certificate; imported/older keys get the revoked-public-key
+        // form instead (OpenPGP.js can't emit a detached cert for an existing key).
+        async _makeRevocationCert() {
+            if (this.settings.revocationCertificate) return this.settings.revocationCertificate;
+            const key = await this.getMyKey(); // unlocked private key
+            const { publicKey } = await this.openpgp.revokeKey({ key, format: "armored" });
+            this.settings.revocationCertificate = publicKey.trim();
+            this.save();
+            return this.settings.revocationCertificate;
+        }
+
+        async _fprOf(armored) {
+            try { return (await this.openpgp.readKey({ armoredKey: armored })).getFingerprint(); }
+            catch (_) { return null; }
+        }
+
+        // Given a posted revocation artifact, return which of our stored keys it
+        // cryptographically revokes: { scope: "self" } or { scope: "contact", id }.
+        // The message author is never trusted; only the signature decides. Returns
+        // null if the artifact verifies against no key we hold.
+        async _matchRevocation(armored) {
+            const cands = [];
+            if (this.settings.publicKey) cands.push({ scope: "self", key: this.settings.publicKey });
+            for (const [id, c] of Object.entries(this.settings.contacts)) {
+                if (c.publicKey) cands.push({ scope: "contact", id, key: c.publicKey });
+            }
+
+            // Form A: a full key block that is already revoked. isRevoked() has
+            // verified the embedded self-signature, so a fingerprint match is safe.
+            let parsed = null;
+            try { parsed = await this.openpgp.readKey({ armoredKey: armored }); } catch (_) {}
+            if (parsed) {
+                if (!(await parsed.isRevoked())) return null; // a normal, live key
+                const fpr = parsed.getFingerprint();
+                for (const cand of cands) {
+                    if ((await this._fprOf(cand.key)) === fpr) return cand;
+                }
+                return null;
+            }
+
+            // Form B: a detached revocation certificate. revokeKey() throws unless
+            // the certificate's signature matches the candidate key.
+            for (const cand of cands) {
+                try {
+                    const revoked = await this.openpgp.revokeKey({
+                        key: await this.openpgp.readKey({ armoredKey: cand.key }),
+                        revocationCertificate: armored,
+                        format: "armored",
+                    });
+                    if (await (await this.openpgp.readKey({ armoredKey: revoked.publicKey })).isRevoked()) return cand;
+                } catch (_) { /* signature does not match this candidate */ }
+            }
+            return null;
+        }
+
         // ---------- sending ----------
         // Resolve a mentioned user id to a saved contact id. If the id isn't a
         // saved contact, fall back to matching the mentioned user's username /
@@ -343,12 +410,12 @@ module.exports = (() => {
             const names = [u.username, u.globalName].filter(Boolean).map((n) => String(n).toLowerCase());
             const matches = Object.entries(this.settings.contacts).filter(([, c]) =>
                 c.publicKey && c.label && names.includes(c.label.toLowerCase()));
-            if (matches.length !== 1) return null; // none or ambiguous — don't guess
+            if (matches.length !== 1) return null; // none or ambiguous: don't guess
             const [oldId, contact] = matches[0];
             delete this.settings.contacts[oldId];
             this.settings.contacts[userId] = contact;
             this.save();
-            BdApi.UI.showToast('PGP: contact "' + contact.label + '" matched by name — saved ID corrected to ' + userId, { type: "info" });
+            BdApi.UI.showToast('PGP: contact "' + contact.label + '" matched by name, saved ID corrected to ' + userId, { type: "info" });
             return userId;
         }
 
@@ -358,7 +425,7 @@ module.exports = (() => {
         }
 
         // If the message BEGINS with a mention (or @label) of a saved contact,
-        // return that contact's id — used to trigger targeted encryption even
+        // return that contact's id, used to trigger targeted encryption even
         // in channels where PGP isn't enabled.
         _leadingTarget(text) {
             const t = (text || "").trimStart();
@@ -509,8 +576,8 @@ module.exports = (() => {
             if (!block) {
                 // Pasted public key? Offer to save the sender as a contact.
                 const pubBlock = raw.match(/-----BEGIN PGP PUBLIC KEY BLOCK-----[\s\S]*?-----END PGP PUBLIC KEY BLOCK-----/);
-                el.dataset.pgpDone = "1"; // either way, processed — skip forever
-                if (pubBlock) this._renderKeyOffer(el, pubBlock[0], channelId, messageId);
+                el.dataset.pgpDone = "1"; // either way, processed; skip forever
+                if (pubBlock) this._handleKeyBlock(el, pubBlock[0], channelId, messageId);
                 return;
             }
             const armored = block[0];
@@ -546,7 +613,7 @@ module.exports = (() => {
             badge.className = "pgp-badge " + (result.ok ? "pgp-ok" : "pgp-fail") + (min ? " pgp-min" : "");
             badge.textContent = min
                 ? (result.ok ? "🔓" : "🔒")
-                : (result.ok ? "🔓 PGP" : "🔒 PGP — can't decrypt");
+                : (result.ok ? "🔓 PGP" : "🔒 PGP (can't decrypt)");
             badge.title = (result.ok ? "" : "Couldn't decrypt. ") + "Click to show the raw PGP message";
             el.appendChild(badge);
             if (result.ok) {
@@ -583,7 +650,7 @@ module.exports = (() => {
 
         // Build the decrypted-message body: plain text, custom Discord emojis
         // (<:name:id> → CDN image), links, and image/GIF URLs. Media is
-        // click-to-load unless autoLoadMedia is on — auto-fetching remote URLs
+        // click-to-load unless autoLoadMedia is on, since auto-fetching remote URLs
         // from an E2E message would leak the reader's IP to the host.
         _renderBody(container, text) {
             const parts = String(text).split(/(<a?:\w+:\d+>|https?:\/\/\S+)/g);
@@ -638,7 +705,7 @@ module.exports = (() => {
                 img.src = url;
                 img.alt = url;
                 img.onerror = () => {
-                    // Blocked by CSP or dead link — degrade to a plain link.
+                    // Blocked by CSP or dead link: degrade to a plain link.
                     wrap.innerHTML = "";
                     const a = document.createElement("a");
                     a.className = "pgp-link";
@@ -654,10 +721,85 @@ module.exports = (() => {
             }
             const load = document.createElement("button");
             load.className = "pgp-media-load";
-            load.textContent = "🖼 Load media" + (host ? " — reveals your IP to " + host : "");
+            load.textContent = "🖼 Load media" + (host ? " (reveals your IP to " + host + ")" : "");
             load.onclick = showImage;
             wrap.appendChild(load);
             return wrap;
+        }
+
+        // A posted "PUBLIC KEY BLOCK" is either a live public key (save-contact
+        // offer) or a revocation artifact (detached cert, or a revoked full key).
+        async _handleKeyBlock(el, armored, channelId, messageId) {
+            if (!this.openpgp) return this._renderKeyOffer(el, armored, channelId, messageId);
+            let parsed = null, revoked = false;
+            try { parsed = await this.openpgp.readKey({ armoredKey: armored }); revoked = await parsed.isRevoked(); } catch (_) {}
+            if (parsed && !revoked) return this._renderKeyOffer(el, armored, channelId, messageId);
+            const match = await this._matchRevocation(armored);
+            this._renderRevocation(el, armored, match);
+        }
+
+        // Render a verified revocation. For a matched contact this auto-marks their
+        // key revoked (encryption to them now fails closed). For our own key it
+        // prompts before wiping the compromised identity.
+        _renderRevocation(el, armored, match) {
+            el.innerHTML = "";
+            const min = this.settings.minimalBadges;
+            const badge = document.createElement("span");
+            badge.className = "pgp-badge pgp-revoke-badge" + (min ? " pgp-min" : "");
+            badge.textContent = min ? "🚫" : "🚫 PGP key revoked";
+            badge.title = "PGP revocation certificate. Click to show the raw block";
+            el.appendChild(badge);
+
+            const info = document.createElement("span");
+            info.className = "pgp-keyoffer-info";
+            if (match && match.scope === "contact") {
+                const c = this.settings.contacts[match.id];
+                const name = (c && c.label) || match.id;
+                if (c && !c.revoked) {
+                    c.revoked = true;
+                    this.save();
+                    this._decorateChannelList();
+                    BdApi.UI.showToast('PGP: "' + name + '" revoked their key. Marked revoked; ask them for a new one.', { type: "error", timeout: 8000 });
+                }
+                info.textContent = "Verified: " + name + "'s key is revoked. Encryption to them is blocked until they send a new key.";
+            } else if (match && match.scope === "self") {
+                info.textContent = "This is a valid revocation certificate for YOUR key.";
+                this._confirm(
+                    "Revoke your own key?",
+                    "A valid revocation certificate for your own key was posted. If your key is compromised, remove it here and generate a new keypair. This clears your keys and passphrase from this machine.",
+                    "Remove my keypair",
+                    () => {
+                        this.settings.privateKey = ""; this.settings.publicKey = "";
+                        this.settings.passphrase = ""; this.settings.revocationCertificate = "";
+                        this.myUnlockedKey = null;
+                        this.save();
+                        BdApi.UI.showToast("Your keypair was removed. Generate a new one in settings.", { type: "info" });
+                    }
+                );
+            } else {
+                info.textContent = "Revocation certificate (no matching saved key).";
+            }
+            el.appendChild(info);
+
+            const raw = document.createElement("div");
+            raw.className = "pgp-raw";
+            raw.style.display = "none";
+            const bar = document.createElement("div");
+            bar.className = "pgp-raw-bar";
+            const barLabel = document.createElement("span");
+            barLabel.textContent = "Revocation certificate · " + armored.length + " chars";
+            bar.appendChild(barLabel);
+            const copy = document.createElement("span");
+            copy.className = "pgp-raw-copy";
+            copy.textContent = "Copy";
+            copy.onclick = (e) => { e.stopPropagation(); this._copy(armored, "Revocation certificate"); };
+            bar.appendChild(copy);
+            raw.appendChild(bar);
+            const pre = document.createElement("pre");
+            pre.textContent = armored;
+            raw.appendChild(pre);
+            el.appendChild(raw);
+            badge.onclick = () => { raw.style.display = raw.style.display === "none" ? "" : "none"; };
         }
 
         // Render an inline "save contact" offer for a pasted public key.
@@ -666,7 +808,7 @@ module.exports = (() => {
             const badge = document.createElement("span");
             badge.className = "pgp-badge pgp-key-badge" + (this.settings.minimalBadges ? " pgp-min" : "");
             badge.textContent = this.settings.minimalBadges ? "🔑" : "🔑 PGP public key";
-            badge.title = "PGP public key — click to show the raw key";
+            badge.title = "PGP public key. Click to show the raw key";
             el.appendChild(badge);
 
             const info = document.createElement("span");
@@ -787,7 +929,10 @@ module.exports = (() => {
                     vertical-align: middle; line-height: 1; opacity: .85;
                 }
                 .pgp-key-badge { background: rgba(88,101,242,.2); color: #7983f5; }
+                .pgp-revoke-badge { background: rgba(237,66,69,.2); color: #ed4245; }
                 .pgp-badge.pgp-min { background: none; color: inherit; padding: 0; font-weight: 400; }
+                .dpgp-contact.dpgp-revoked { opacity: .6; }
+                .dpgp-revoked-tag { margin-left: 6px; font-size: 9px; font-weight: 700; letter-spacing: .04em; color: #ed4245; border: 1px solid rgba(237,66,69,.5); border-radius: 3px; padding: 0 4px; vertical-align: middle; }
                 .pgp-keyoffer { margin-top: 4px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
                 .pgp-keyoffer-info { font-size: 11px; color: var(--text-muted, #949ba4); }
                 .pgp-keyoffer-btn {
@@ -926,11 +1071,16 @@ module.exports = (() => {
             BdApi.UI.showToast(what + " copied", { type: "success" });
         }
 
-        _confirm(title, text, confirmText, onConfirm) {
+        _confirm(title, text, confirmText, onConfirm, cancelText, onCancel) {
             if (BdApi.UI && typeof BdApi.UI.showConfirmationModal === "function") {
-                BdApi.UI.showConfirmationModal(title, text, { danger: true, confirmText, onConfirm });
+                const opts = { danger: true, confirmText, onConfirm };
+                if (cancelText) opts.cancelText = cancelText;
+                if (onCancel) opts.onCancel = onCancel;
+                BdApi.UI.showConfirmationModal(title, text, opts);
             } else if (window.confirm(title + "\n\n" + text)) {
                 onConfirm();
+            } else if (onCancel) {
+                onCancel();
             }
         }
 
@@ -941,7 +1091,7 @@ module.exports = (() => {
             return {
                 algo,
                 fingerprint: key.getFingerprint().toUpperCase().replace(/(.{4})/g, "$1 ").trim(),
-                user: key.getUserIDs()[0] || "—",
+                user: key.getUserIDs()[0] || "(none)",
                 created: key.getCreationTime().toLocaleDateString(),
             };
         }
@@ -1007,7 +1157,7 @@ module.exports = (() => {
 
             // ===== my identity =====
             const idBody = section("My identity",
-                hasKey ? "Your keypair — share the public half" : "Generate a key below, or import an existing one",
+                hasKey ? "Your keypair. Share the public half" : "Generate a key below, or import an existing one",
                 true);
 
             const rawWrap = el("div", "dpgp-stack");
@@ -1042,16 +1192,35 @@ module.exports = (() => {
                 idRow.appendChild(btn("Edit / import keys", "secondary", () => {
                     rawWrap.style.display = rawWrap.style.display === "none" ? "" : "none";
                 }));
-                idRow.appendChild(btn("Delete keypair", "danger", () => this._confirm(
+                const doDelete = () => this._confirm(
                     "Delete keypair?",
                     "This removes your keys and passphrase from this machine. Messages encrypted to this key become unreadable unless you have a backup.",
                     "Delete",
                     () => {
-                        s.publicKey = ""; s.privateKey = ""; s.passphrase = "";
+                        s.publicKey = ""; s.privateKey = ""; s.passphrase = ""; s.revocationCertificate = "";
                         this.myUnlockedKey = null;
                         this.save();
                         this._buildPanel(panel);
                     }
+                );
+                // Nudge the user to publish a revocation certificate first, but let
+                // them bypass straight to deletion.
+                idRow.appendChild(btn("Delete keypair", "danger", () => this._confirm(
+                    "Revoke before deleting?",
+                    "If this key might be compromised, copy your revocation certificate and post it to your contacts so their clients stop using this key. Copying does not delete your keys; you can delete afterwards.",
+                    "Copy revocation certificate",
+                    async () => {
+                        try {
+                            const cert = await this._makeRevocationCert();
+                            this._copy(cert, "Revocation certificate");
+                            BdApi.UI.showToast("Post it to your contacts, then delete your keypair.", { type: "info", timeout: 8000 });
+                            this._buildPanel(panel);
+                        } catch (e) {
+                            BdApi.UI.showToast("Couldn't make certificate: " + e.message, { type: "error" });
+                        }
+                    },
+                    "Delete without revoking",
+                    doDelete
                 )));
             }
             idBody.appendChild(idRow);
@@ -1062,10 +1231,34 @@ module.exports = (() => {
             rawWrap.appendChild(labeled("Public key (armored)", pub));
             rawWrap.appendChild(labeled("Private key (armored)", priv));
             rawWrap.appendChild(labeled("Passphrase", myPass.row));
+            // Revocation certificate: shown below the private key. Publish this if
+            // your key is ever compromised so contacts stop encrypting to it.
+            const revField = el("div", "dpgp-field");
+            revField.appendChild(el("label", "dpgp-label", { textContent: "Revocation certificate" }));
+            const revArea = el("textarea", "dpgp-input mono", { value: s.revocationCertificate, spellcheck: false, readOnly: true, placeholder: "Generate below, then keep it somewhere safe." });
+            revField.appendChild(revArea);
+            const revRow = el("div", "dpgp-row");
+            if (s.revocationCertificate) {
+                revRow.appendChild(btn("Copy revocation certificate", "secondary", () => this._copy(s.revocationCertificate, "Revocation certificate")));
+            } else if (hasKey) {
+                const genRevBtn = btn("Generate revocation certificate", "secondary", async () => {
+                    genRevBtn.disabled = true; genRevBtn.textContent = "Generating…";
+                    try { await this._makeRevocationCert(); this._buildPanel(panel); }
+                    catch (e) { BdApi.UI.showToast("Failed: " + e.message, { type: "error" }); genRevBtn.disabled = false; genRevBtn.textContent = "Generate revocation certificate"; }
+                });
+                revRow.appendChild(genRevBtn);
+            }
+            revField.appendChild(revRow);
+            revField.appendChild(el("div", "dpgp-muted", { textContent: "Posting this certificate revokes your key for everyone running the plugin. Keep it private until then." }));
+            rawWrap.appendChild(revField);
+
             const saveRow = el("div", "dpgp-row");
             saveRow.appendChild(btn("Save keys", "", () => {
+                const newPriv = priv.value.trim();
+                // A pasted/changed private key invalidates any cached revocation cert.
+                if (newPriv !== s.privateKey) s.revocationCertificate = "";
                 s.publicKey = pub.value.trim();
-                s.privateKey = priv.value.trim();
+                s.privateKey = newPriv;
                 s.passphrase = myPass.input.value;
                 this.myUnlockedKey = null;
                 this.save();
@@ -1076,7 +1269,7 @@ module.exports = (() => {
             idBody.appendChild(rawWrap);
 
             // ===== generate =====
-            const genBody = section("Generate a new keypair", "ECC (recommended) or RSA — output is armored", !hasKey);
+            const genBody = section("Generate a new keypair", "ECC (recommended) or RSA; output is armored", !hasKey);
 
             const nameGrid = el("div", "dpgp-grid2");
             const genName = el("input", "dpgp-input", { type: "text", placeholder: "Alice (optional)" });
@@ -1085,7 +1278,7 @@ module.exports = (() => {
             nameGrid.appendChild(labeled("Email", genEmail));
             genBody.appendChild(nameGrid);
 
-            const genPass = passInput("Recommended — protects the private key at rest", "");
+            const genPass = passInput("Recommended; protects the private key at rest", "");
             genBody.appendChild(labeled("Passphrase for the new key", genPass.row));
 
             const seg = el("div", "dpgp-seg");
@@ -1144,10 +1337,11 @@ module.exports = (() => {
                         genOpts.type = "ecc";
                         genOpts.curve = genCurve.value;
                     }
-                    const { privateKey, publicKey } = await this.openpgp.generateKey(genOpts);
+                    const { privateKey, publicKey, revocationCertificate } = await this.openpgp.generateKey(genOpts);
                     s.publicKey = publicKey.trim();
                     s.privateKey = privateKey.trim();
                     s.passphrase = genPass.input.value || "";
+                    s.revocationCertificate = (revocationCertificate || "").trim();
                     this.myUnlockedKey = null;
                     this.save();
                     BdApi.UI.showToast("New keypair generated & saved", { type: "success" });
@@ -1203,7 +1397,7 @@ module.exports = (() => {
                 this.save();
                 BdApi.UI.showToast(
                     (editingId ? "Contact updated" : "Contact saved")
-                    + (id.startsWith("name:") ? " — ID will resolve on first mention/DM" : " (ID " + id + ")"),
+                    + (id.startsWith("name:") ? ". ID will resolve on first mention/DM" : " (ID " + id + ")"),
                     { type: "success" });
                 this._buildPanel(panel);
             });
@@ -1219,14 +1413,16 @@ module.exports = (() => {
 
             if (!contactIds.length) {
                 conBody.appendChild(el("div", "dpgp-muted", { textContent:
-                    "No contacts yet — paste a friend's public key below. Easiest: set the label to their exact Discord username and leave the User ID blank; the plugin resolves the ID itself. (Manual ID: Developer Mode → right-click user → Copy User ID.)" }));
+                    "No contacts yet. Paste a friend's public key below. Easiest: set the label to their exact Discord username and leave the User ID blank; the plugin resolves the ID itself. (Manual ID: Developer Mode → right-click user → Copy User ID.)" }));
             }
             for (const id of contactIds) {
                 const c = s.contacts[id];
-                const card = el("div", "dpgp-contact");
+                const card = el("div", "dpgp-contact" + (c.revoked ? " dpgp-revoked" : ""));
                 const info = el("div", "dpgp-contact-info");
-                info.appendChild(el("div", "dpgp-contact-name", { textContent: c.label || "Unnamed contact" }));
-                const idText = id.startsWith("name:") ? "ID pending — matches by username" : "ID " + id;
+                const nameEl = el("div", "dpgp-contact-name", { textContent: c.label || "Unnamed contact" });
+                if (c.revoked) nameEl.appendChild(el("span", "dpgp-revoked-tag", { textContent: "REVOKED" }));
+                info.appendChild(nameEl);
+                const idText = id.startsWith("name:") ? "ID pending, matches by username" : "ID " + id;
                 const meta = el("div", "dpgp-contact-meta mono", { textContent: idText });
                 info.appendChild(meta);
                 card.appendChild(info);
@@ -1234,6 +1430,11 @@ module.exports = (() => {
                     this._keyInfo(c.publicKey)
                         .then((i) => { meta.textContent = idText + "  ·  " + i.algo + "  ·  " + i.fingerprint; })
                         .catch(() => { meta.textContent = idText + "  ·  ⚠ unreadable key"; });
+                }
+                if (c.revoked) {
+                    card.appendChild(btn("Clear flag", "secondary eye", () => {
+                        delete c.revoked; this.save(); this._buildPanel(panel);
+                    }));
                 }
                 card.appendChild(btn("Edit", "secondary eye", () => {
                     editingId = id;
@@ -1268,7 +1469,7 @@ module.exports = (() => {
                 vTimer = setTimeout(() => {
                     if (!this.openpgp) return;
                     this._keyInfo(v)
-                        .then((i) => { status.textContent = "✓ Valid key — " + i.algo + " · " + i.fingerprint; status.className = "dpgp-status ok"; })
+                        .then((i) => { status.textContent = "✓ Valid key: " + i.algo + " · " + i.fingerprint; status.className = "dpgp-status ok"; })
                         .catch(() => { status.textContent = "✗ Not a valid public key"; status.className = "dpgp-status err"; });
                 }, 300);
             };
@@ -1300,8 +1501,7 @@ module.exports = (() => {
             }
 
             // ===== options =====
-            const optBody = section("Options", "Signing & decryption behaviour", false);
-            const mkSwitch = (key, title, sub) => {
+            const mkSwitch = (parent, key, title, sub) => {
                 const row = el("div", "dpgp-opt");
                 const tw = el("div");
                 tw.appendChild(el("div", "dpgp-opt-title", { textContent: title }));
@@ -1313,17 +1513,21 @@ module.exports = (() => {
                 lab.appendChild(cb);
                 lab.appendChild(el("span", "dpgp-slider"));
                 row.appendChild(lab);
-                optBody.appendChild(row);
+                parent.appendChild(row);
             };
-            mkSwitch("signMessages", "Sign outgoing messages", "Lets recipients holding your public key verify it was really you");
-            mkSwitch("autoDecrypt", "Auto-decrypt incoming messages", "Replaces PGP blocks in chat with the decrypted text and a badge");
-            mkSwitch("minimalBadges", "Minimal encryption signs", "Just a plain lock icon on messages — no color, no PGP text");
-            mkSwitch("richContent", "Rich content in decrypted messages (opt-in)", "Render emojis, clickable links, and media in decrypted text. Off = plain text only, nothing is ever fetched");
-            mkSwitch("renderEmojis", "└ Render custom emojis", "Shows <:emoji:> images — fetched from Discord's CDN. Needs rich content on");
-            mkSwitch("autoLoadMedia", "└ Auto-load images & GIFs (opsec risk)", "Fetches linked media without asking — reveals your IP and read-time to the host. Off = click-to-load button. Needs rich content on");
+
+            const encBody = section("Encryption", "Signing and decryption", false);
+            mkSwitch(encBody, "signMessages", "Sign outgoing messages", "Lets recipients holding your public key verify it was really you");
+            mkSwitch(encBody, "autoDecrypt", "Auto-decrypt incoming messages", "Replaces PGP blocks in chat with the decrypted text and a badge");
+
+            const miscBody = section("Miscellaneous", "Badges and rich content", false);
+            mkSwitch(miscBody, "minimalBadges", "Minimal encryption signs", "Just a plain lock icon on messages, no color or PGP text");
+            mkSwitch(miscBody, "richContent", "Rich content in decrypted messages (opt-in)", "Render emojis, clickable links, and media in decrypted text. Off = plain text only, nothing is ever fetched");
+            mkSwitch(miscBody, "renderEmojis", "└ Render custom emojis", "Shows <:emoji:> images, fetched from Discord's CDN. Needs rich content on");
+            mkSwitch(miscBody, "autoLoadMedia", "└ Auto-load images & GIFs (opsec risk)", "Fetches linked media without asking, revealing your IP and read-time to the host. Off = click-to-load button. Needs rich content on");
 
             panel.appendChild(el("div", "dpgp-foot", { textContent:
-                "Commands: /pgp on · /pgp off · /pgp status — keys are stored unencrypted on this machine." }));
+                "Commands: /pgp on · /pgp off · /pgp status. Keys are stored unencrypted on this machine." }));
         }
     }
 
