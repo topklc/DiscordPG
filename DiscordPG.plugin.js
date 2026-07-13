@@ -2,7 +2,7 @@
  * @name DiscordPG
  * @author topklc
  * @authorId 0
- * @version 1.8.0
+ * @version 1.12.0
  * @description End-to-end PGP encryption for Discord messages using OpenPGP.js. Generate/import keys, encrypt to your contacts, and auto-decrypt incoming PGP blocks inline. Use "/pgp on" or "/pgp off" in a channel to toggle encryption.
  * @website https://github.com/topklc/DiscordPG
  * @source https://github.com/topklc/DiscordPG/blob/main/DiscordPG.plugin.js
@@ -23,7 +23,7 @@ module.exports = (() => {
 
     const config = {
         name: "DiscordPG",
-        version: "1.8.0",
+        version: "1.12.0",
         author: "topklc",
     };
 
@@ -41,6 +41,7 @@ module.exports = (() => {
         revocationCertificate: "", // armored cert to publish if this key is compromised
         contacts: {},          // { [userId]: { label, publicKey, revoked? } }
         enabledChannels: {},   // { [channelId]: true }
+        groups: {},            // { [channelId]: [contactId, ...] } local recipient set per channel
         signMessages: true,
         autoDecrypt: true,
         minimalBadges: false,  // plain 🔓/🔒/🔑 on messages instead of the colored PGP tag
@@ -82,6 +83,7 @@ module.exports = (() => {
             this.settings = Object.assign({}, DEFAULTS, saved || {});
             this.settings.contacts = this.settings.contacts || {};
             this.settings.enabledChannels = this.settings.enabledChannels || {};
+            this.settings.groups = this.settings.groups || {};
         }
         save() {
             BdApi.Data.save(config.name, "settings", this.settings);
@@ -100,6 +102,7 @@ module.exports = (() => {
 
         stop() {
             this.ready = false;
+            this._unregisterCommands();
             BdApi.Patcher.unpatchAll(config.name);
             BdApi.DOM.removeStyle(config.name);
             if (this.observer) { this.observer.disconnect(); this.observer = null; }
@@ -121,6 +124,7 @@ module.exports = (() => {
             }
 
             this._patchSend();
+            this._registerCommands();
             this._startObserver();
             this.ready = true;
             BdApi.UI.showToast("DiscordPG ready", { type: "success" });
@@ -248,23 +252,30 @@ module.exports = (() => {
             return key;
         }
 
+        // Default recipient keys for a channel (before @mention targeting).
+        //  - DMs / group DMs: the channel's actual recipients.
+        //  - Guild channels: the local group defined for that channel, if any.
+        // There is no "encrypt to every contact" fallback: a guild channel with no
+        // group yields no recipients, so a plain message there fails closed unless
+        // it @mentions specific contacts.
         _recipientPublicKeys(channelId) {
             const ch = this.ChannelStore && this.ChannelStore.getChannel(channelId);
             const ids = (ch && ch.recipients) || [];
-            let keys = ids
-                .map((id) => {
-                    // _resolveContactId also matches username-only contacts and
-                    // heals their stored ID, so DMs work without a manual ID.
-                    const rid = this._resolveContactId(id);
-                    const c = rid && this.settings.contacts[rid];
-                    return c && !c.revoked && c.publicKey; // never encrypt to a revoked key
-                })
-                .filter(Boolean);
-            // Fallback (e.g. guild channels have no recipients list): encrypt to every known contact.
-            if (!keys.length) {
-                keys = Object.values(this.settings.contacts).filter((c) => !c.revoked && c.publicKey).map((c) => c.publicKey);
+            if (ids.length) {
+                return ids
+                    .map((id) => {
+                        // _resolveContactId also matches username-only contacts and
+                        // heals their stored ID, so DMs work without a manual ID.
+                        const rid = this._resolveContactId(id);
+                        const c = rid && this.settings.contacts[rid];
+                        return c && !c.revoked && c.publicKey; // never encrypt to a revoked key
+                    })
+                    .filter(Boolean);
             }
-            return keys;
+            const group = (this.settings.groups && this.settings.groups[channelId]) || [];
+            return group
+                .map((id) => { const c = this.settings.contacts[id]; return c && !c.revoked && c.publicKey; })
+                .filter(Boolean);
         }
 
         async encryptForChannel(channelId, text) {
@@ -313,16 +324,25 @@ module.exports = (() => {
             } else {
                 armoredRecips = this._recipientPublicKeys(channelId);
             }
+            // Fail closed: refuse rather than silently encrypt to ourselves only,
+            // which would post a message nobody else could read.
+            if (!armoredRecips.length) {
+                const ch = this.ChannelStore && this.ChannelStore.getChannel(channelId);
+                const isDM = ch && ch.recipients && ch.recipients.length;
+                throw new Error(isDM
+                    ? "No saved key for this conversation. Save their public key first."
+                    : "No recipients for this channel. Use /pgp group add @user, or @mention someone.");
+            }
             const encryptionKeys = [];
             for (const a of armoredRecips) {
                 try { encryptionKeys.push(await this.openpgp.readKey({ armoredKey: a })); } catch (_) {}
             }
+            if (!encryptionKeys.length) {
+                throw new Error("No recipient public key. Add a contact key in settings.");
+            }
             // Always encrypt to ourselves so we can read our own sent messages.
             if (this.settings.publicKey) {
                 try { encryptionKeys.push(await this.openpgp.readKey({ armoredKey: this.settings.publicKey })); } catch (_) {}
-            }
-            if (!encryptionKeys.length) {
-                throw new Error("No recipient public key. Add a contact key in settings.");
             }
             const opts = {
                 message: await this.openpgp.createMessage({ text }),
@@ -424,26 +444,11 @@ module.exports = (() => {
             return u && u.username ? "@" + u.username + " (" + userId + ")" : userId;
         }
 
-        // If the message BEGINS with a mention (or @label) of a saved contact,
-        // return that contact's id, used to trigger targeted encryption even
-        // in channels where PGP isn't enabled.
-        _leadingTarget(text) {
-            const t = (text || "").trimStart();
-            const m = t.match(/^<@!?(\d+)>/);
-            if (m) {
-                return this._resolveContactId(m[1]); // null for non-contacts → normal send
-            }
-            for (const [id, c] of Object.entries(this.settings.contacts)) {
-                if (!c.label || !c.publicKey) continue;
-                const esc = c.label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-                if (new RegExp("^@" + esc + "(?![a-z0-9_])", "i").test(t)) return id;
-            }
-            return null;
-        }
-
         _patchSend() {
             const self = this;
             BdApi.Patcher.instead(config.name, this.MessageActions, "sendMessage", (_thisObj, args, original) => {
+                // One-shot plaintext post from a native command (see _sendPlain).
+                if (self._bypassOnce) { self._bypassOnce = false; return original(...args); }
                 const [channelId, message] = args;
                 const content = (message && message.content) || "";
 
@@ -451,15 +456,29 @@ module.exports = (() => {
                 // picker can swallow unknown /commands before they're sent.
                 const lead = content.trimStart();
                 if (lead.startsWith("/pgp") || lead.startsWith(".pgp")) {
-                    self._handleCommand(channelId, content.trim());
-                    return Promise.resolve({}); // swallow the command; don't send it
+                    return (async () => {
+                        let replacement;
+                        try { replacement = await self._handleCommand(channelId, content.trim()); }
+                        catch (e) { BdApi.UI.showToast("PGP: " + e.message, { type: "error" }); return {}; }
+                        // A command may return replacement content to post as-is
+                        // (plaintext, via the unpatched send). Otherwise swallow.
+                        if (typeof replacement === "string" && replacement) {
+                            if (replacement.length > 2000) {
+                                BdApi.UI.showToast("PGP: too long to post (>2000 chars).", { type: "error" });
+                                return {};
+                            }
+                            message.content = replacement;
+                            return original(...args);
+                        }
+                        return {};
+                    })();
                 }
 
-                // Encrypt when the channel is enabled, OR when the message leads
-                // with @<saved contact> (explicit one-off targeted encryption).
-                const encryptHere = self.ready &&
-                    (self.settings.enabledChannels[channelId] || self._leadingTarget(content));
-                if (!encryptHere) {
+                // Only encrypt when the channel is explicitly enabled (/pgp on).
+                // With PGP off, messages are sent as-is even if they @mention a
+                // saved contact; @mention targeting only applies inside an enabled
+                // channel.
+                if (!self.ready || !self.settings.enabledChannels[channelId]) {
                     return original(...args);
                 }
 
@@ -481,33 +500,227 @@ module.exports = (() => {
             });
         }
 
-        _handleCommand(channelId, content) {
-            const sub = (content.split(/\s+/)[1] || "").toLowerCase();
-            if (sub === "on") {
-                this.settings.enabledChannels[channelId] = true; this.save();
-                this._decorateChannelList();
-                BdApi.UI.showToast("🔒 PGP encryption ON for this channel", { type: "success" });
-            } else if (sub === "off") {
-                delete this.settings.enabledChannels[channelId]; this.save();
-                this._decorateChannelList();
-                BdApi.UI.showToast("🔓 PGP encryption OFF for this channel", { type: "info" });
-            } else if (sub === "status") {
-                const on = !!this.settings.enabledChannels[channelId];
-                BdApi.UI.showToast("PGP is " + (on ? "ON" : "OFF") + " here", { type: "info" });
-            } else if (sub === "debug") {
-                const s = this.settings;
-                const info = "ready=" + this.ready
-                    + " | openpgp=" + !!this.openpgp
-                    + " | hasKey=" + !!(s.privateKey && s.publicKey)
-                    + " | contacts=" + Object.keys(s.contacts).length
-                    + " | thisChannelEnabled=" + !!s.enabledChannels[channelId]
-                    + " | enabledChannels=" + Object.keys(s.enabledChannels).length;
-                BdApi.UI.showToast("PGP debug: " + info, { type: "info", timeout: 10000 });
-                console.log("[DiscordPG] debug:", info, "| contact ids:", Object.keys(s.contacts),
-                    "| labels:", Object.values(s.contacts).map((c) => c.label));
+        // Handle a "/pgp <sub> ..." command. Returns a string to post as-is
+        // (plaintext) into the channel, or nothing to swallow the command.
+        async _handleCommand(channelId, content) {
+            const tokens = content.trim().split(/\s+/);
+            const sub = (tokens[1] || "").toLowerCase();
+            let r;
+            if (sub === "group") {
+                const action = (tokens[2] || "list").toLowerCase();
+                const targets = (action === "add" || action === "remove") ? this._contactsInText(content) : [];
+                r = this._runGroupAction(action, targets, channelId);
             } else {
-                BdApi.UI.showToast("Commands: /pgp on | off | status | debug  (also works as .pgp)", { type: "info" });
+                r = await this._runVerb(sub, tokens.slice(2).join(" "), channelId);
             }
+            if (r.reply) BdApi.UI.showToast(r.reply, { type: r.error ? "error" : "info" });
+            return r.post; // string here is posted as plaintext via the return-value path
+        }
+
+        // Shared command action for both the text and native command paths.
+        // Returns { reply?, post?, error? }:
+        //   reply: user feedback (toast for text, Clyde bot message natively)
+        //   post:  content to send into the channel as plaintext
+        async _runVerb(verb, arg, channelId) {
+            const s = this.settings;
+            switch ((verb || "").toLowerCase()) {
+                case "on":
+                    s.enabledChannels[channelId] = true; this.save(); this._decorateChannelList();
+                    return { reply: "🔒 Encryption ON for this channel." };
+                case "off":
+                    delete s.enabledChannels[channelId]; this.save(); this._decorateChannelList();
+                    return { reply: "🔓 Encryption OFF for this channel." };
+                case "status": {
+                    const on = !!s.enabledChannels[channelId];
+                    const g = (s.groups[channelId] || []).map((id) => (s.contacts[id] && s.contacts[id].label) || id);
+                    return { reply: "PGP is " + (on ? "ON" : "OFF") + " here" + (g.length ? ". Group: " + g.join(", ") : "") + "." };
+                }
+                case "help":
+                    return { reply: "Commands: on, off, status, share, revoke, group add/remove/list/clear, debug, help." };
+                case "debug":
+                    return { reply: "debug: " + this._debugInfo(channelId) };
+                case "share":
+                    if (!s.publicKey) return { reply: "No key yet. Generate one in settings.", error: true };
+                    return { post: s.publicKey, reply: "Shared your public key." };
+                case "revoke": {
+                    if (!s.privateKey) return { reply: "No key to revoke.", error: true };
+                    let cert;
+                    try { cert = await this._makeRevocationCert(); }
+                    catch (e) { return { reply: "Couldn't make certificate: " + e.message, error: true }; }
+                    const ok = await this._confirmAsync(
+                        "Revoke and delete this keypair?",
+                        "This posts a certificate that revokes your key for everyone who sees it, and removes your keypair from this device. You will no longer be able to read messages encrypted to it. Only do this if the key is compromised or retired.",
+                        "Revoke");
+                    if (!ok) return { reply: "Revocation cancelled." };
+                    s.privateKey = ""; s.publicKey = ""; s.passphrase = ""; s.revocationCertificate = "";
+                    this.myUnlockedKey = null; this.save();
+                    return { post: cert, reply: "Keypair removed. Revocation posted." };
+                }
+                default:
+                    return { reply: "Unknown command. Try /pgp help.", error: true };
+            }
+        }
+
+        // Apply a group action to a channel. targetIds are already-resolved
+        // contact ids. Returns { reply, error? }.
+        _runGroupAction(action, targetIds, channelId) {
+            const s = this.settings;
+            const label = (id) => (s.contacts[id] && s.contacts[id].label) || id;
+            const current = s.groups[channelId] || [];
+            if (action === "list") {
+                return { reply: current.length ? "Group here: " + current.map(label).join(", ") : "No group set here. Add with /pgp group add." };
+            }
+            if (action === "clear") {
+                delete s.groups[channelId]; this.save();
+                return { reply: "Group cleared for this channel." };
+            }
+            if (action === "add" || action === "remove") {
+                if (!targetIds.length) return { reply: "No saved contact matched. Save their key first.", error: true };
+                const set = new Set(current);
+                if (action === "add") targetIds.forEach((id) => set.add(id));
+                else targetIds.forEach((id) => set.delete(id));
+                const next = [...set];
+                if (next.length) s.groups[channelId] = next; else delete s.groups[channelId];
+                if (action === "add") { s.enabledChannels[channelId] = true; this._decorateChannelList(); }
+                this.save();
+                return { reply: (action === "add" ? "Added to" : "Removed from") + " group: " + targetIds.map(label).join(", ")
+                    + (action === "add" ? ". Encryption is ON here." : "") };
+            }
+            return { reply: "Usage: group add | remove | list | clear", error: true };
+        }
+
+        _debugInfo(channelId) {
+            const s = this.settings;
+            const info = "ready=" + this.ready + " | openpgp=" + !!this.openpgp
+                + " | hasKey=" + !!(s.privateKey && s.publicKey)
+                + " | contacts=" + Object.keys(s.contacts).length
+                + " | thisChannelEnabled=" + !!s.enabledChannels[channelId]
+                + " | groupHere=" + ((s.groups[channelId] || []).length)
+                + " | nativeCommands=" + !!this.commandsNative;
+            console.log("[DiscordPG] debug:", info, "| contact ids:", Object.keys(s.contacts),
+                "| labels:", Object.values(s.contacts).map((c) => c.label));
+            return info;
+        }
+
+        _confirmAsync(title, text, confirmText) {
+            return new Promise((resolve) => {
+                let done = false;
+                const guard = setTimeout(() => finish(false), 120000);
+                function finish(v) { if (!done) { done = true; clearTimeout(guard); resolve(v); } }
+                this._confirm(title, text, confirmText, () => finish(true), "Cancel", () => finish(false));
+            });
+        }
+
+        // Resolve saved contacts referenced in text, by <@id> mention or @label.
+        _contactsInText(text) {
+            const ids = new Set();
+            for (const m of text.matchAll(/<@!?(\d+)>/g)) {
+                const rid = this._resolveContactId(m[1]);
+                if (rid) ids.add(rid);
+            }
+            for (const [id, c] of Object.entries(this.settings.contacts)) {
+                if (!c.label || !c.publicKey) continue;
+                const esc = c.label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                if (new RegExp("(^|[^a-z0-9_])@" + esc + "(?![a-z0-9_])", "i").test(text)) ids.add(id);
+            }
+            return [...ids];
+        }
+
+        // Post plaintext into a channel, bypassing encryption for this one send.
+        // Used by native slash commands (share/revoke) where there is no typed
+        // message to rewrite. The text path posts via the send-patch return value
+        // instead, reusing Discord's own message object.
+        _sendPlain(channelId, text) {
+            this._bypassOnce = true;
+            try {
+                this.MessageActions.sendMessage(channelId, { content: text, tts: false, invalidEmojis: [], validNonShortcutEmojis: [] });
+            } catch (e) {
+                this._bypassOnce = false;
+                BdApi.UI.showToast("Couldn't post: " + e.message, { type: "error" });
+            }
+        }
+
+        // ---------- native slash commands (BetterDiscord >= ~1.13) ----------
+        // Each verb is its own command (pgp-on, pgp-share, ...). BetterDiscord
+        // injects commands into Discord's command index WITHOUT the server-side
+        // subcommand expansion real app commands get, so SUB_COMMAND options
+        // render as fillable inputs ("value required") instead of subcommands.
+        // Separate flat commands are the only shape that works; typing /pgp
+        // still lists them all together.
+        _registerCommands() {
+            const C = BdApi.Commands;
+            if (!C || typeof C.register !== "function") return; // older BD: text/.pgp commands only
+            const O = (C.Types && C.Types.OptionTypes) || { STRING: 3 };
+            const self = this;
+            const userOpt = { name: "user", description: "Mention or contact label, e.g. @bob", type: O.STRING, required: true };
+            const defs = [
+                { verb: "on", desc: "Enable encryption for this channel" },
+                { verb: "off", desc: "Disable encryption for this channel" },
+                { verb: "status", desc: "Show encryption status here" },
+                { verb: "share", desc: "Post your public key into this channel" },
+                { verb: "revoke", desc: "Revoke and delete your keypair" },
+                { verb: "help", desc: "List DiscordPG commands" },
+                { verb: "debug", desc: "Show plugin state" },
+                { verb: "group-add", desc: "Add a contact to this channel's group", options: [userOpt], group: "add" },
+                { verb: "group-remove", desc: "Remove a contact from this channel's group", options: [userOpt], group: "remove" },
+                { verb: "group-list", desc: "List this channel's group members", group: "list" },
+                { verb: "group-clear", desc: "Clear this channel's group", group: "clear" },
+            ];
+            this._unregisterCmds = [];
+            for (const d of defs) {
+                const cmd = {
+                    id: "pgp-" + d.verb,
+                    name: "pgp-" + d.verb,
+                    description: d.desc,
+                    execute: async (opts, props) => {
+                        try {
+                            const channelId = props && props.channel && props.channel.id;
+                            let r;
+                            if (d.group) {
+                                const u = Array.isArray(opts) && opts.find((o) => o.name === "user");
+                                const text = u && u.value != null ? String(u.value) : "";
+                                r = self._runGroupAction(d.group, text ? self._contactsFromInput(text) : [], channelId);
+                            } else {
+                                r = await self._runVerb(d.verb, "", channelId);
+                            }
+                            if (r.post) self._sendPlain(channelId, r.post);
+                            return { content: r.reply || "Done." };
+                        } catch (e) {
+                            return { content: "DiscordPG error: " + e.message };
+                        }
+                    },
+                };
+                if (d.options) cmd.options = d.options;
+                try {
+                    const un = C.register(config.name, cmd);
+                    if (typeof un === "function") this._unregisterCmds.push(un);
+                } catch (e) {
+                    console.error("[DiscordPG] command registration failed:", cmd.id, e);
+                }
+            }
+            this.commandsNative = this._unregisterCmds.length > 0;
+        }
+
+        _unregisterCommands() {
+            try {
+                if (Array.isArray(this._unregisterCmds)) this._unregisterCmds.forEach((un) => { try { un(); } catch (_) {} });
+                else if (BdApi.Commands && BdApi.Commands.unregisterAll) BdApi.Commands.unregisterAll(config.name);
+            } catch (_) {}
+            this._unregisterCmds = [];
+            this.commandsNative = false;
+        }
+
+        // Resolve contacts from a free-text command option: real mentions,
+        // "@label", or a bare label without the @.
+        _contactsFromInput(text) {
+            let ids = this._contactsInText(text);
+            if (!ids.length) {
+                const lower = text.trim().replace(/^@/, "").toLowerCase();
+                ids = Object.entries(this.settings.contacts)
+                    .filter(([, c]) => c.publicKey && c.label && c.label.toLowerCase() === lower)
+                    .map(([id]) => id);
+            }
+            return ids;
         }
 
         // ---------- receiving / decryption ----------
@@ -541,14 +754,17 @@ module.exports = (() => {
                 const id = (a.getAttribute("href") || "").split("/").pop();
                 const enabled = !!this.settings.enabledChannels[id];
                 const existing = a.querySelector(".pgp-chan-badge");
+                const cls = "pgp-chan-badge" + (this.settings.minimalBadges ? " pgp-min" : "");
                 if (enabled && !existing) {
                     const b = document.createElement("span");
-                    b.className = "pgp-chan-badge";
+                    b.className = cls;
                     b.textContent = "🔒";
                     b.title = "PGP encryption enabled";
                     // Prefer sitting right after the channel name; fall back to the link.
                     const name = a.querySelector('[class*="name"]');
                     (name || a).appendChild(b);
+                } else if (enabled && existing) {
+                    existing.className = cls; // keep in sync with the minimal setting
                 } else if (!enabled && existing) {
                     existing.remove();
                 }
@@ -925,9 +1141,11 @@ module.exports = (() => {
                     color: var(--text-normal, #dbdee1);
                 }
                 .pgp-chan-badge {
-                    display: inline-block; margin-left: 5px; font-size: 10px;
-                    vertical-align: middle; line-height: 1; opacity: .85;
+                    display: inline-block; margin-left: 5px; font-size: 9px; font-weight: 600;
+                    padding: 1px 5px; border-radius: 6px; vertical-align: middle; line-height: 1.5;
+                    background: rgba(59,165,92,.2); color: #3ba55c;
                 }
+                .pgp-chan-badge.pgp-min { background: none; padding: 0; font-size: 10px; font-weight: 400; }
                 .pgp-key-badge { background: rgba(88,101,242,.2); color: #7983f5; }
                 .pgp-revoke-badge { background: rgba(237,66,69,.2); color: #ed4245; }
                 .pgp-badge.pgp-min { background: none; color: inherit; padding: 0; font-weight: 400; }
@@ -1118,9 +1336,9 @@ module.exports = (() => {
                 w.appendChild(node);
                 return w;
             };
-            const section = (title, sub, open) => {
+            const section = (title, sub) => {
+                // All sections start collapsed when settings open.
                 const d = el("details", "dpgp-sec");
-                if (open) d.open = true;
                 const sum = el("summary", "dpgp-sum");
                 const tw = el("div", "dpgp-sum-text");
                 tw.appendChild(el("div", "dpgp-sum-title", { textContent: title }));
@@ -1192,17 +1410,15 @@ module.exports = (() => {
                 idRow.appendChild(btn("Edit / import keys", "secondary", () => {
                     rawWrap.style.display = rawWrap.style.display === "none" ? "" : "none";
                 }));
-                const doDelete = () => this._confirm(
-                    "Delete keypair?",
-                    "This removes your keys and passphrase from this machine. Messages encrypted to this key become unreadable unless you have a backup.",
-                    "Delete",
-                    () => {
-                        s.publicKey = ""; s.privateKey = ""; s.passphrase = ""; s.revocationCertificate = "";
-                        this.myUnlockedKey = null;
-                        this.save();
-                        this._buildPanel(panel);
-                    }
-                );
+                // Delete the keypair now. The "Delete without revoking" choice in
+                // the modal below is itself the confirmation, so this does not open
+                // a second dialog.
+                const doDelete = () => {
+                    s.publicKey = ""; s.privateKey = ""; s.passphrase = ""; s.revocationCertificate = "";
+                    this.myUnlockedKey = null;
+                    this.save();
+                    this._buildPanel(panel);
+                };
                 // Nudge the user to publish a revocation certificate first, but let
                 // them bypass straight to deletion.
                 idRow.appendChild(btn("Delete keypair", "danger", () => this._confirm(
@@ -1523,8 +1739,8 @@ module.exports = (() => {
             const miscBody = section("Miscellaneous", "Badges and rich content", false);
             mkSwitch(miscBody, "minimalBadges", "Minimal encryption signs", "Just a plain lock icon on messages, no color or PGP text");
             mkSwitch(miscBody, "richContent", "Rich content in decrypted messages (opt-in)", "Render emojis, clickable links, and media in decrypted text. Off = plain text only, nothing is ever fetched");
-            mkSwitch(miscBody, "renderEmojis", "└ Render custom emojis", "Shows <:emoji:> images, fetched from Discord's CDN. Needs rich content on");
-            mkSwitch(miscBody, "autoLoadMedia", "└ Auto-load images & GIFs (opsec risk)", "Fetches linked media without asking, revealing your IP and read-time to the host. Off = click-to-load button. Needs rich content on");
+            mkSwitch(miscBody, "renderEmojis", "Render custom emojis", "Shows <:emoji:> images, fetched from Discord's CDN. Needs rich content on");
+            mkSwitch(miscBody, "autoLoadMedia", "Auto-load images & GIFs (opsec risk)", "Fetches linked media without asking, revealing your IP and read-time to the host. Off = click-to-load button. Needs rich content on");
 
             panel.appendChild(el("div", "dpgp-foot", { textContent:
                 "Commands: /pgp on · /pgp off · /pgp status. Keys are stored unencrypted on this machine." }));

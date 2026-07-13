@@ -14,7 +14,7 @@ A [BetterDiscord](https://betterdiscord.app/) plugin that provides end-to-end PG
 
 **Encryption**
 - Per-channel encryption toggle. With the toggle on, outgoing messages are encrypted to the channel's recipients (detected automatically in direct messages) and to your own key, and optionally signed.
-- Recipient targeting via mentions: mentioning a saved contact restricts encryption to that contact only. A message that begins with the mention is encrypted even in channels where the toggle is off, enabling one-off private messages.
+- Recipient targeting via mentions: within an encrypted channel, mentioning a saved contact restricts encryption to that contact only, instead of the channel's group. Encryption only ever happens when the channel toggle is on; a message in a channel with PGP off is always sent as-is, even if it mentions a contact.
 - Fail-closed behavior throughout: if encryption cannot be completed for any reason, the message is not sent. Plaintext is never transmitted on an encrypted channel.
 
 **Decryption and display**
@@ -36,18 +36,33 @@ Open the plugin settings:
 
 1. Under "Generate a new keypair", choose an algorithm, set a passphrase, and generate. Alternatively, paste an existing armored keypair under "My identity" and save.
 2. Copy your public key and send it to the people you want to message. When they post theirs, click the save prompt that appears on the message, or paste the key manually under "Contacts".
-3. In the conversation, type `/pgp on` to enable encryption, then chat normally.
+3. In the conversation, use `/pgp-on` (or type `.pgp on`) to enable encryption, then chat normally.
 
 ## Usage
 
+On BetterDiscord 1.13+ the plugin registers native slash commands: type `/pgp` and
+they appear in Discord's autocomplete, replying with a private "only you can see
+this" message. They are flat commands (`/pgp-on`, not `/pgp on`) because
+BetterDiscord injects commands into Discord's index without the subcommand
+expansion real application commands get.
+
 | Command | Effect |
 |---|---|
-| `/pgp on` | Enable encryption for the current channel |
-| `/pgp off` | Disable encryption for the current channel |
-| `/pgp status` | Show whether encryption is active here |
-| `/pgp debug` | Show plugin state (key, contacts, channel status) |
+| `/pgp-on` | Enable encryption for the current channel |
+| `/pgp-off` | Disable encryption for the current channel |
+| `/pgp-status` | Show whether encryption is active here |
+| `/pgp-share` | Post your public key into the channel |
+| `/pgp-revoke` | Post your revocation certificate and delete your keypair (confirmed) |
+| `/pgp-group-add` | Add a saved contact to this channel's recipient group |
+| `/pgp-group-remove` | Remove a contact from this channel's group |
+| `/pgp-group-list` | List this channel's group members |
+| `/pgp-group-clear` | Clear this channel's group |
+| `/pgp-help` | List commands |
+| `/pgp-debug` | Show plugin state (key, contacts, channel status) |
 
-Every command is also available with a `.pgp` prefix, which avoids Discord's slash-command menu.
+Every command is also available as a typed message with a `.pgp` prefix (e.g.
+`.pgp on`, `.pgp group add @bob`), which works on any BetterDiscord version and
+avoids the slash-command menu entirely.
 
 Mention-based targeting: with encryption enabled, `@contact message` encrypts to that contact only, instead of all channel recipients. Both real Discord mentions and a plain-text `@label` matching a saved contact's label are recognized. If a mentioned user has no saved key, the send is blocked and the missing user is named in the error.
 
