@@ -2,8 +2,8 @@
  * @name DiscordPG
  * @author topklc
  * @authorId 0
- * @version 1.12.0
- * @description End-to-end PGP encryption for Discord messages using OpenPGP.js. Generate/import keys, encrypt to your contacts, and auto-decrypt incoming PGP blocks inline. Use "/pgp on" or "/pgp off" in a channel to toggle encryption.
+ * @version 1.13.0
+ * @description End-to-end PGP encryption for Discord messages using OpenPGP.js. Generate/import keys, encrypt to your contacts, and auto-decrypt incoming PGP blocks inline.
  * @website https://github.com/topklc/DiscordPG
  * @source https://github.com/topklc/DiscordPG/blob/main/DiscordPG.plugin.js
  * @updateUrl https://raw.githubusercontent.com/topklc/DiscordPG/main/DiscordPG.plugin.js
@@ -23,7 +23,7 @@ module.exports = (() => {
 
     const config = {
         name: "DiscordPG",
-        version: "1.12.0",
+        version: "1.13.0",
         author: "topklc",
     };
 
@@ -45,6 +45,7 @@ module.exports = (() => {
         signMessages: true,
         autoDecrypt: true,
         minimalBadges: false,  // plain 🔓/🔒/🔑 on messages instead of the colored PGP tag
+        clydeReplies: true,    // native /pgp-... commands reply with a private bot message; off = small toast
         richContent: false,    // master opt-in: render emojis/links/media in decrypted messages
         renderEmojis: true,    // custom Discord emoji (loads from Discord's CDN); needs richContent
         autoLoadMedia: false,  // auto-fetch image/GIF links (leaks IP to host!); needs richContent
@@ -55,7 +56,7 @@ module.exports = (() => {
         getAuthor() { return config.author; }
         getVersion() { return config.version; }
         getDescription() {
-            return "PGP encryption for Discord messages. Toggle a channel with /pgp on | off.";
+            return "PGP encryption for Discord messages.";
         }
 
         constructor() {
@@ -243,10 +244,26 @@ module.exports = (() => {
             if (!this.settings.privateKey) throw new Error("No private key set (open plugin settings).");
             let key = await this.openpgp.readPrivateKey({ armoredKey: this.settings.privateKey });
             if (!key.isDecrypted()) {
-                key = await this.openpgp.decryptKey({
-                    privateKey: key,
-                    passphrase: this.settings.passphrase || "",
-                });
+                try {
+                    key = await this.openpgp.decryptKey({
+                        privateKey: key,
+                        passphrase: this.settings.passphrase || "",
+                    });
+                } catch (e) {
+                    const m = (e && e.message) || "";
+                    // GnuPG 2.4+ protects exported secret keys with AEAD/OCB,
+                    // which OpenPGP.js v5 cannot parse.
+                    if (/unsupported s2k|cipher algo/i.test(m)) {
+                        throw new Error("Your private key uses a protection format this plugin can't read"
+                            + " (typical for keys exported from GnuPG 2.4+)."
+                            + " Fix: clear the key's passphrase in GnuPG (gpg --edit-key <id>, passwd, empty),"
+                            + " re-export it, paste it here, or generate a fresh key in settings.");
+                    }
+                    if (/incorrect key passphrase/i.test(m)) {
+                        throw new Error("Wrong passphrase for your private key. Fix it in plugin settings.");
+                    }
+                    throw e;
+                }
             }
             this.myUnlockedKey = key;
             return key;
@@ -629,14 +646,21 @@ module.exports = (() => {
         // Post plaintext into a channel, bypassing encryption for this one send.
         // Used by native slash commands (share/revoke) where there is no typed
         // message to rewrite. The text path posts via the send-patch return value
-        // instead, reusing Discord's own message object.
-        _sendPlain(channelId, text) {
+        // instead, reusing Discord's own message object. Returns true on success.
+        async _sendPlain(channelId, text) {
+            const msg = { content: text, tts: false, invalidEmojis: [], validNonShortcutEmojis: [] };
             this._bypassOnce = true;
             try {
-                this.MessageActions.sendMessage(channelId, { content: text, tts: false, invalidEmojis: [], validNonShortcutEmojis: [] });
+                // Current Discord needs the trailing (promise, options) arguments;
+                // a 2-argument call silently posts nothing.
+                const r = this.MessageActions.sendMessage(channelId, msg, undefined, {});
+                if (r && typeof r.then === "function") await r;
+                return true;
             } catch (e) {
                 this._bypassOnce = false;
-                BdApi.UI.showToast("Couldn't post: " + e.message, { type: "error" });
+                console.error("[DiscordPG] plaintext post failed:", e);
+                BdApi.UI.showToast("Couldn't post: " + ((e && e.message) || e), { type: "error" });
+                return false;
             }
         }
 
@@ -683,10 +707,13 @@ module.exports = (() => {
                             } else {
                                 r = await self._runVerb(d.verb, "", channelId);
                             }
-                            if (r.post) self._sendPlain(channelId, r.post);
-                            return { content: r.reply || "Done." };
+                            if (r.post) {
+                                const sent = await self._sendPlain(channelId, r.post);
+                                if (!sent) return self._cmdReply("Posting failed. Check the console (Ctrl+Shift+I) for details.");
+                            }
+                            return self._cmdReply(r.reply || "Done.", r.error);
                         } catch (e) {
-                            return { content: "DiscordPG error: " + e.message };
+                            return self._cmdReply("DiscordPG error: " + e.message, true);
                         }
                     },
                 };
@@ -699,6 +726,14 @@ module.exports = (() => {
                 }
             }
             this.commandsNative = this._unregisterCmds.length > 0;
+        }
+
+        // Deliver command feedback: a private Clyde bot message (returned to the
+        // command system) when clydeReplies is on, otherwise a small toast.
+        _cmdReply(text, isError) {
+            if (this.settings.clydeReplies) return { content: text };
+            BdApi.UI.showToast(text, { type: isError ? "error" : "info" });
+            return undefined; // no bot message
         }
 
         _unregisterCommands() {
@@ -1065,7 +1100,7 @@ module.exports = (() => {
                         : "Save contact: " + name;
                     save.onclick = () => {
                         const label = (existing && existing.label) || name;
-                        this.settings.contacts[String(author.id)] = { label, publicKey: armored };
+                        this.settings.contacts[String(author.id)] = { label, publicKey: armored, addedAt: Date.now() };
                         this.save();
                         BdApi.UI.showToast('PGP contact "' + label + '" saved', { type: "success" });
                         offer.innerHTML = "";
@@ -1315,6 +1350,17 @@ module.exports = (() => {
         }
 
         _buildPanel(panel) {
+            // Rebuilds (after add/remove/save/...) must not collapse the section
+            // the user is working in: remember which sections are open and
+            // restore them. A fresh settings open has none, so all start closed.
+            const openSections = new Set();
+            if (typeof panel.querySelectorAll === "function") {
+                panel.querySelectorAll("details.dpgp-sec").forEach((d) => {
+                    if (!d.open) return;
+                    const t = d.querySelector(".dpgp-sum-title");
+                    if (t) openSections.add(t.textContent);
+                });
+            }
             panel.innerHTML = "";
             const s = this.settings;
             const hasKey = !!(s.privateKey && s.publicKey);
@@ -1337,8 +1383,9 @@ module.exports = (() => {
                 return w;
             };
             const section = (title, sub) => {
-                // All sections start collapsed when settings open.
+                // Collapsed on a fresh open; kept open across rebuilds.
                 const d = el("details", "dpgp-sec");
+                if (openSections.has(title)) d.open = true;
                 const sum = el("summary", "dpgp-sum");
                 const tw = el("div", "dpgp-sum-text");
                 tw.appendChild(el("div", "dpgp-sum-title", { textContent: title }));
@@ -1375,7 +1422,7 @@ module.exports = (() => {
 
             // ===== my identity =====
             const idBody = section("My identity",
-                hasKey ? "Your keypair. Share the public half" : "Generate a key below, or import an existing one",
+                hasKey ? "Your keypair" : "No key yet",
                 true);
 
             const rawWrap = el("div", "dpgp-stack");
@@ -1443,15 +1490,13 @@ module.exports = (() => {
 
             const pub = el("textarea", "dpgp-input mono", { value: s.publicKey, spellcheck: false, placeholder: "-----BEGIN PGP PUBLIC KEY BLOCK-----" });
             const priv = el("textarea", "dpgp-input mono", { value: s.privateKey, spellcheck: false, placeholder: "-----BEGIN PGP PRIVATE KEY BLOCK-----" });
-            const myPass = passInput("Passphrase that unlocks your private key", s.passphrase);
-            rawWrap.appendChild(labeled("Public key (armored)", pub));
-            rawWrap.appendChild(labeled("Private key (armored)", priv));
-            rawWrap.appendChild(labeled("Passphrase", myPass.row));
-            // Revocation certificate: shown below the private key. Publish this if
-            // your key is ever compromised so contacts stop encrypting to it.
+            const myPass = passInput("Optional", s.passphrase);
+            rawWrap.appendChild(labeled("Public key", pub));
+            rawWrap.appendChild(labeled("Private key", priv));
+            // Revocation certificate sits between the private key and passphrase.
             const revField = el("div", "dpgp-field");
             revField.appendChild(el("label", "dpgp-label", { textContent: "Revocation certificate" }));
-            const revArea = el("textarea", "dpgp-input mono", { value: s.revocationCertificate, spellcheck: false, readOnly: true, placeholder: "Generate below, then keep it somewhere safe." });
+            const revArea = el("textarea", "dpgp-input mono", { value: s.revocationCertificate, spellcheck: false, readOnly: true, placeholder: "Not generated yet." });
             revField.appendChild(revArea);
             const revRow = el("div", "dpgp-row");
             if (s.revocationCertificate) {
@@ -1465,8 +1510,9 @@ module.exports = (() => {
                 revRow.appendChild(genRevBtn);
             }
             revField.appendChild(revRow);
-            revField.appendChild(el("div", "dpgp-muted", { textContent: "Posting this certificate revokes your key for everyone running the plugin. Keep it private until then." }));
+            revField.appendChild(el("div", "dpgp-muted", { textContent: "Posting this revokes your key." }));
             rawWrap.appendChild(revField);
+            rawWrap.appendChild(labeled("Passphrase", myPass.row));
 
             const saveRow = el("div", "dpgp-row");
             saveRow.appendChild(btn("Save keys", "", () => {
@@ -1485,18 +1531,9 @@ module.exports = (() => {
             idBody.appendChild(rawWrap);
 
             // ===== generate =====
-            const genBody = section("Generate a new keypair", "ECC (recommended) or RSA; output is armored", !hasKey);
+            const genBody = section("Generate a new keypair", "ECC or RSA", !hasKey);
 
-            const nameGrid = el("div", "dpgp-grid2");
-            const genName = el("input", "dpgp-input", { type: "text", placeholder: "Alice (optional)" });
-            const genEmail = el("input", "dpgp-input", { type: "text", placeholder: "alice@example.com (optional)" });
-            nameGrid.appendChild(labeled("Name", genName));
-            nameGrid.appendChild(labeled("Email", genEmail));
-            genBody.appendChild(nameGrid);
-
-            const genPass = passInput("Recommended; protects the private key at rest", "");
-            genBody.appendChild(labeled("Passphrase for the new key", genPass.row));
-
+            // Algorithm choice first, then identity fields, then passphrase.
             const seg = el("div", "dpgp-seg");
             const bEcc = el("button", "active", { type: "button", textContent: "ECC" });
             const bRsa = el("button", "", { type: "button", textContent: "RSA" });
@@ -1507,17 +1544,27 @@ module.exports = (() => {
             const genCurve = el("select", "dpgp-input");
             for (const c of ["curve25519", "ed25519", "nistP256", "nistP384", "nistP521",
                              "brainpoolP256r1", "brainpoolP384r1", "brainpoolP512r1", "secp256k1"]) {
-                genCurve.appendChild(el("option", null, { value: c, textContent: c + (c === "curve25519" ? "  (recommended)" : "") }));
+                genCurve.appendChild(el("option", null, { value: c, textContent: c }));
             }
             const curveField = labeled("Curve", genCurve);
             const genRsa = el("select", "dpgp-input");
             for (const b of [2048, 3072, 4096]) {
-                genRsa.appendChild(el("option", null, { value: String(b), textContent: b + " bits" + (b === 4096 ? "  (recommended)" : "") }));
+                genRsa.appendChild(el("option", null, { value: String(b), textContent: b + " bits" }));
             }
             genRsa.value = "4096";
             const rsaField = labeled("Key size", genRsa);
             genBody.appendChild(curveField);
             genBody.appendChild(rsaField);
+
+            const nameGrid = el("div", "dpgp-grid2");
+            const genName = el("input", "dpgp-input", { type: "text", placeholder: "Alice (optional)" });
+            const genEmail = el("input", "dpgp-input", { type: "text", placeholder: "alice@example.com (optional)" });
+            nameGrid.appendChild(labeled("Name", genName));
+            nameGrid.appendChild(labeled("Email", genEmail));
+            genBody.appendChild(nameGrid);
+
+            const genPass = passInput("Optional", "");
+            genBody.appendChild(labeled("Passphrase", genPass.row));
 
             let algoType = "ecc";
             const setAlgo = (t) => {
@@ -1573,7 +1620,7 @@ module.exports = (() => {
             // ===== contacts =====
             const contactIds = Object.keys(s.contacts);
             const conBody = section("Contacts",
-                contactIds.length ? contactIds.length + " public key" + (contactIds.length === 1 ? "" : "s") + " stored" : "Add your friends' public keys",
+                contactIds.length ? contactIds.length + " public key" + (contactIds.length === 1 ? "" : "s") + " stored" : "No contacts",
                 hasKey && !contactIds.length);
 
             // Add/edit form elements are created up front so per-card Edit
@@ -1608,8 +1655,11 @@ module.exports = (() => {
                     if (!id) id = "name:" + label.toLowerCase();
                 }
                 // When editing, replace the original entry even if its key changed.
+                // Keep the original added date unless the key itself changed.
+                const prev = editingId ? s.contacts[editingId] : s.contacts[id];
+                const addedAt = (prev && prev.publicKey === key && prev.addedAt) ? prev.addedAt : Date.now();
                 if (editingId && editingId !== id) delete s.contacts[editingId];
-                s.contacts[id] = { label, publicKey: key };
+                s.contacts[id] = { label, publicKey: key, addedAt };
                 this.save();
                 BdApi.UI.showToast(
                     (editingId ? "Contact updated" : "Contact saved")
@@ -1629,7 +1679,7 @@ module.exports = (() => {
 
             if (!contactIds.length) {
                 conBody.appendChild(el("div", "dpgp-muted", { textContent:
-                    "No contacts yet. Paste a friend's public key below. Easiest: set the label to their exact Discord username and leave the User ID blank; the plugin resolves the ID itself. (Manual ID: Developer Mode → right-click user → Copy User ID.)" }));
+                    "Paste a public key below. Blank User ID resolves from the username." }));
             }
             for (const id of contactIds) {
                 const c = s.contacts[id];
@@ -1639,18 +1689,14 @@ module.exports = (() => {
                 if (c.revoked) nameEl.appendChild(el("span", "dpgp-revoked-tag", { textContent: "REVOKED" }));
                 info.appendChild(nameEl);
                 const idText = id.startsWith("name:") ? "ID pending, matches by username" : "ID " + id;
-                const meta = el("div", "dpgp-contact-meta mono", { textContent: idText });
+                const addedText = c.addedAt ? "  ·  added " + new Date(c.addedAt).toLocaleDateString() : "";
+                const meta = el("div", "dpgp-contact-meta mono", { textContent: idText + addedText });
                 info.appendChild(meta);
                 card.appendChild(info);
                 if (this.openpgp) {
                     this._keyInfo(c.publicKey)
-                        .then((i) => { meta.textContent = idText + "  ·  " + i.algo + "  ·  " + i.fingerprint; })
-                        .catch(() => { meta.textContent = idText + "  ·  ⚠ unreadable key"; });
-                }
-                if (c.revoked) {
-                    card.appendChild(btn("Clear flag", "secondary eye", () => {
-                        delete c.revoked; this.save(); this._buildPanel(panel);
-                    }));
+                        .then((i) => { meta.textContent = idText + "  ·  " + i.algo + "  ·  " + i.fingerprint + addedText; })
+                        .catch(() => { meta.textContent = idText + "  ·  ⚠ unreadable key" + addedText; });
                 }
                 card.appendChild(btn("Edit", "secondary eye", () => {
                     editingId = id;
@@ -1663,6 +1709,11 @@ module.exports = (() => {
                     if (cLabel.scrollIntoView) cLabel.scrollIntoView({ behavior: "smooth", block: "center" });
                 }));
                 card.appendChild(btn("Copy", "secondary eye", () => this._copy(c.publicKey, "Contact's public key")));
+                if (c.revoked) {
+                    card.appendChild(btn("Clear flag", "secondary eye", () => {
+                        delete c.revoked; this.save(); this._buildPanel(panel);
+                    }));
+                }
                 card.appendChild(btn("Remove", "danger", () => {
                     delete s.contacts[id];
                     this.save();
@@ -1675,7 +1726,7 @@ module.exports = (() => {
             addGrid.appendChild(labeled("Label / username", cLabel));
             addGrid.appendChild(labeled("User ID (optional)", cId));
             conBody.appendChild(addGrid);
-            conBody.appendChild(labeled("Their public key (armored)", cKey));
+            conBody.appendChild(labeled("Their public key", cKey));
             conBody.appendChild(status);
             let vTimer = null;
             cKey.oninput = () => {
@@ -1700,7 +1751,7 @@ module.exports = (() => {
             const chBody = section("Encrypted channels", chanIds.length ? chanIds.length + " enabled" : "None enabled", false);
             if (!chanIds.length) {
                 chBody.appendChild(el("div", "dpgp-muted", { textContent:
-                    "Type  /pgp on  in any channel to start encrypting it. It will show up here." }));
+                    "None. Enable with /pgp on." }));
             }
             for (const id of chanIds) {
                 const ch = this.ChannelStore && this.ChannelStore.getChannel(id);
@@ -1733,17 +1784,18 @@ module.exports = (() => {
             };
 
             const encBody = section("Encryption", "Signing and decryption", false);
-            mkSwitch(encBody, "signMessages", "Sign outgoing messages", "Lets recipients holding your public key verify it was really you");
-            mkSwitch(encBody, "autoDecrypt", "Auto-decrypt incoming messages", "Replaces PGP blocks in chat with the decrypted text and a badge");
+            mkSwitch(encBody, "signMessages", "Sign outgoing messages", "Recipients can verify the sender");
+            mkSwitch(encBody, "autoDecrypt", "Auto-decrypt incoming messages", "Show PGP blocks as readable text");
 
             const miscBody = section("Miscellaneous", "Badges and rich content", false);
-            mkSwitch(miscBody, "minimalBadges", "Minimal encryption signs", "Just a plain lock icon on messages, no color or PGP text");
-            mkSwitch(miscBody, "richContent", "Rich content in decrypted messages (opt-in)", "Render emojis, clickable links, and media in decrypted text. Off = plain text only, nothing is ever fetched");
-            mkSwitch(miscBody, "renderEmojis", "Render custom emojis", "Shows <:emoji:> images, fetched from Discord's CDN. Needs rich content on");
-            mkSwitch(miscBody, "autoLoadMedia", "Auto-load images & GIFs (opsec risk)", "Fetches linked media without asking, revealing your IP and read-time to the host. Off = click-to-load button. Needs rich content on");
+            mkSwitch(miscBody, "minimalBadges", "Minimal encryption signs", "Plain lock icon only");
+            mkSwitch(miscBody, "richContent", "Rich content in decrypted messages", "Emojis, links, and media");
+            mkSwitch(miscBody, "renderEmojis", "Render custom emojis", "Needs rich content");
+            mkSwitch(miscBody, "autoLoadMedia", "Auto-load images & GIFs (opsec risk)", "Reveals your IP to media hosts. Needs rich content");
+            mkSwitch(miscBody, "clydeReplies", "Command replies as bot message", "Off = small toast");
 
             panel.appendChild(el("div", "dpgp-foot", { textContent:
-                "Commands: /pgp on · /pgp off · /pgp status. Keys are stored unencrypted on this machine." }));
+                "Keys are stored unencrypted on this device." }));
         }
     }
 
