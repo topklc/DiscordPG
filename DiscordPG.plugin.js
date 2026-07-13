@@ -2,7 +2,7 @@
  * @name DiscordPG
  * @author topklc
  * @authorId 0
- * @version 1.5.0
+ * @version 1.7.4
  * @description End-to-end PGP encryption for Discord messages using OpenPGP.js. Generate/import keys, encrypt to your contacts, and auto-decrypt incoming PGP blocks inline. Use "/pgp on" or "/pgp off" in a channel to toggle encryption.
  * @website https://github.com/
  * @source https://github.com/
@@ -22,7 +22,7 @@ module.exports = (() => {
 
     const config = {
         name: "DiscordPG",
-        version: "1.5.0",
+        version: "1.7.4",
         author: "topklc",
     };
 
@@ -41,6 +41,10 @@ module.exports = (() => {
         enabledChannels: {},   // { [channelId]: true }
         signMessages: true,
         autoDecrypt: true,
+        minimalBadges: false,  // plain 🔓/🔒/🔑 on messages instead of the colored PGP tag
+        richContent: false,    // master opt-in: render emojis/links/media in decrypted messages
+        renderEmojis: true,    // custom Discord emoji (loads from Discord's CDN) — needs richContent
+        autoLoadMedia: false,  // auto-fetch image/GIF links (leaks IP to host!) — needs richContent
     };
 
     class DiscordPG {
@@ -503,7 +507,10 @@ module.exports = (() => {
 
             const block = raw.match(/-----BEGIN PGP MESSAGE-----[\s\S]*?-----END PGP MESSAGE-----/);
             if (!block) {
-                el.dataset.pgpDone = "1"; // not a PGP message; skip forever
+                // Pasted public key? Offer to save the sender as a contact.
+                const pubBlock = raw.match(/-----BEGIN PGP PUBLIC KEY BLOCK-----[\s\S]*?-----END PGP PUBLIC KEY BLOCK-----/);
+                el.dataset.pgpDone = "1"; // either way, processed — skip forever
+                if (pubBlock) this._renderKeyOffer(el, pubBlock[0], channelId, messageId);
                 return;
             }
             const armored = block[0];
@@ -534,15 +541,22 @@ module.exports = (() => {
 
         _render(el, result, armored) {
             el.innerHTML = "";
+            const min = this.settings.minimalBadges;
             const badge = document.createElement("span");
-            badge.className = "pgp-badge " + (result.ok ? "pgp-ok" : "pgp-fail");
-            badge.textContent = result.ok ? "🔓 PGP" : "🔒 PGP — can't decrypt";
-            badge.title = "Click to show the raw PGP message";
+            badge.className = "pgp-badge " + (result.ok ? "pgp-ok" : "pgp-fail") + (min ? " pgp-min" : "");
+            badge.textContent = min
+                ? (result.ok ? "🔓" : "🔒")
+                : (result.ok ? "🔓 PGP" : "🔒 PGP — can't decrypt");
+            badge.title = (result.ok ? "" : "Couldn't decrypt. ") + "Click to show the raw PGP message";
             el.appendChild(badge);
             if (result.ok) {
                 const body = document.createElement("span");
                 body.className = "pgp-body";
-                body.textContent = result.text; // textContent = safe, no HTML injection
+                if (this.settings.richContent) {
+                    this._renderBody(body, result.text); // element-built, no HTML injection
+                } else {
+                    body.textContent = result.text; // plain text, nothing fetched
+                }
                 el.appendChild(body);
             }
             // Expandable viewer for the actual armored ciphertext.
@@ -562,6 +576,168 @@ module.exports = (() => {
             raw.appendChild(bar);
             const pre = document.createElement("pre");
             pre.textContent = armored || "";
+            raw.appendChild(pre);
+            el.appendChild(raw);
+            badge.onclick = () => { raw.style.display = raw.style.display === "none" ? "" : "none"; };
+        }
+
+        // Build the decrypted-message body: plain text, custom Discord emojis
+        // (<:name:id> → CDN image), links, and image/GIF URLs. Media is
+        // click-to-load unless autoLoadMedia is on — auto-fetching remote URLs
+        // from an E2E message would leak the reader's IP to the host.
+        _renderBody(container, text) {
+            const parts = String(text).split(/(<a?:\w+:\d+>|https?:\/\/\S+)/g);
+            for (const part of parts) {
+                if (!part) continue;
+                const em = part.match(/^<(a?):(\w+):(\d+)>$/);
+                if (em && this.settings.renderEmojis) {
+                    const img = document.createElement("img");
+                    img.className = "pgp-emoji";
+                    img.src = "https://cdn.discordapp.com/emojis/" + em[3] + "." + (em[1] ? "gif" : "png") + "?size=48&quality=lossless";
+                    img.alt = img.title = ":" + em[2] + ":";
+                    // If the CDN load fails, fall back to the text form.
+                    img.onerror = () => {
+                        const t = document.createElement("span");
+                        t.textContent = ":" + em[2] + ":";
+                        img.replaceWith(t);
+                    };
+                    container.appendChild(img);
+                    continue;
+                }
+                const isUrl = /^https?:\/\//i.test(part);
+                const isMedia = isUrl && /\.(gif|png|jpe?g|webp)(\?\S*)?$/i.test(part);
+                if (isMedia) {
+                    container.appendChild(this._mediaNode(part));
+                    continue;
+                }
+                if (isUrl) {
+                    const a = document.createElement("a");
+                    a.className = "pgp-link";
+                    a.href = part;
+                    a.textContent = part;
+                    a.target = "_blank";
+                    a.rel = "noreferrer noopener";
+                    container.appendChild(a);
+                    continue;
+                }
+                const span = document.createElement("span");
+                span.textContent = part;
+                container.appendChild(span);
+            }
+        }
+
+        _mediaNode(url) {
+            const wrap = document.createElement("div");
+            wrap.className = "pgp-media";
+            let host = "";
+            try { host = new URL(url).hostname; } catch (_) {}
+            const showImage = () => {
+                wrap.innerHTML = "";
+                const img = document.createElement("img");
+                img.className = "pgp-media-img";
+                img.src = url;
+                img.alt = url;
+                img.onerror = () => {
+                    // Blocked by CSP or dead link — degrade to a plain link.
+                    wrap.innerHTML = "";
+                    const a = document.createElement("a");
+                    a.className = "pgp-link";
+                    a.href = url; a.textContent = url;
+                    a.target = "_blank"; a.rel = "noreferrer noopener";
+                    wrap.appendChild(a);
+                };
+                wrap.appendChild(img);
+            };
+            if (this.settings.autoLoadMedia) {
+                showImage();
+                return wrap;
+            }
+            const load = document.createElement("button");
+            load.className = "pgp-media-load";
+            load.textContent = "🖼 Load media" + (host ? " — reveals your IP to " + host : "");
+            load.onclick = showImage;
+            wrap.appendChild(load);
+            return wrap;
+        }
+
+        // Render an inline "save contact" offer for a pasted public key.
+        _renderKeyOffer(el, armored, channelId, messageId) {
+            el.innerHTML = "";
+            const badge = document.createElement("span");
+            badge.className = "pgp-badge pgp-key-badge" + (this.settings.minimalBadges ? " pgp-min" : "");
+            badge.textContent = this.settings.minimalBadges ? "🔑" : "🔑 PGP public key";
+            badge.title = "PGP public key — click to show the raw key";
+            el.appendChild(badge);
+
+            const info = document.createElement("span");
+            info.className = "pgp-keyoffer-info";
+            info.textContent = "…";
+            el.appendChild(info);
+            if (this.openpgp) {
+                this._keyInfo(armored)
+                    .then((i) => { info.textContent = i.algo + " · " + i.fingerprint; })
+                    .catch(() => { info.textContent = "⚠ couldn't parse this key"; });
+            }
+
+            const offer = document.createElement("div");
+            offer.className = "pgp-keyoffer";
+            const msg = channelId && this.MessageStore ? this.MessageStore.getMessage(channelId, messageId) : null;
+            const author = msg && msg.author ? msg.author : null;
+            const me = this.UserStore && this.UserStore.getCurrentUser && this.UserStore.getCurrentUser();
+            if (author && me && String(author.id) === String(me.id)) {
+                const mine = document.createElement("span");
+                mine.className = "pgp-keyoffer-saved";
+                mine.textContent = "your key";
+                offer.appendChild(mine);
+            } else if (author) {
+                const name = author.username || author.globalName || String(author.id);
+                const existing = this.settings.contacts[author.id];
+                const sameKey = existing && existing.publicKey &&
+                    existing.publicKey.replace(/\s+/g, "") === armored.replace(/\s+/g, "");
+                if (sameKey) {
+                    const saved = document.createElement("span");
+                    saved.className = "pgp-keyoffer-saved";
+                    saved.textContent = "✓ saved contact" + (existing.label ? " · " + existing.label : "");
+                    offer.appendChild(saved);
+                } else {
+                    const save = document.createElement("button");
+                    save.className = "pgp-keyoffer-btn";
+                    save.textContent = existing
+                        ? "Update key for " + (existing.label || name)
+                        : "Save contact: " + name;
+                    save.onclick = () => {
+                        const label = (existing && existing.label) || name;
+                        this.settings.contacts[String(author.id)] = { label, publicKey: armored };
+                        this.save();
+                        BdApi.UI.showToast('PGP contact "' + label + '" saved', { type: "success" });
+                        offer.innerHTML = "";
+                        const done = document.createElement("span");
+                        done.className = "pgp-keyoffer-saved";
+                        done.textContent = "✓ saved";
+                        offer.appendChild(done);
+                    };
+                    offer.appendChild(save);
+                }
+            }
+            el.appendChild(offer);
+
+            // Expandable raw key (same pattern as encrypted payloads).
+            const raw = document.createElement("div");
+            raw.className = "pgp-raw";
+            raw.style.display = "none";
+            const bar = document.createElement("div");
+            bar.className = "pgp-raw-bar";
+            const t = document.createElement("span");
+            t.textContent = "Public key · " + armored.length + " chars";
+            bar.appendChild(t);
+            const copy = document.createElement("span");
+            copy.className = "pgp-raw-copy";
+            copy.textContent = "Copy";
+            copy.onclick = (e) => { e.stopPropagation(); this._copy(armored, "Public key"); };
+            bar.appendChild(copy);
+            raw.appendChild(bar);
+            const pre = document.createElement("pre");
+            pre.textContent = armored;
             raw.appendChild(pre);
             el.appendChild(raw);
             badge.onclick = () => { raw.style.display = raw.style.display === "none" ? "" : "none"; };
@@ -610,60 +786,78 @@ module.exports = (() => {
                     display: inline-block; margin-left: 5px; font-size: 10px;
                     vertical-align: middle; line-height: 1; opacity: .85;
                 }
+                .pgp-key-badge { background: rgba(88,101,242,.2); color: #7983f5; }
+                .pgp-badge.pgp-min { background: none; color: inherit; padding: 0; font-weight: 400; }
+                .pgp-keyoffer { margin-top: 4px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+                .pgp-keyoffer-info { font-size: 11px; color: var(--text-muted, #949ba4); }
+                .pgp-keyoffer-btn {
+                    border: none; border-radius: 5px; padding: 4px 10px; font-size: 12px; font-weight: 600;
+                    cursor: pointer; background: var(--brand-experiment, #5865f2); color: #fff;
+                }
+                .pgp-keyoffer-btn:hover { filter: brightness(1.1); }
+                .pgp-keyoffer-saved { font-size: 12px; color: #3ba55c; font-weight: 600; }
+                .pgp-emoji { width: 22px; height: 22px; vertical-align: -5px; margin: 0 1px; }
+                .pgp-link { color: var(--text-link, #00a8fc); }
+                .pgp-link:hover { text-decoration: underline; }
+                .pgp-media { margin-top: 4px; }
+                .pgp-media-img { display: block; max-width: 300px; max-height: 300px; border-radius: 8px; }
+                .pgp-media-load {
+                    border: 1px solid var(--background-modifier-accent, rgba(255,255,255,.12));
+                    border-radius: 6px; padding: 5px 10px; font-size: 12px; cursor: pointer;
+                    background: var(--background-secondary, rgba(0,0,0,.2)); color: var(--text-muted, #949ba4);
+                }
+                .pgp-media-load:hover { color: var(--text-normal, #dbdee1); }
 
                 /* ===== settings panel ===== */
-                .dpgp-panel { color: var(--text-normal, #dbdee1); font-size: 14px; display: flex; flex-direction: column; gap: 12px; padding: 4px 2px 12px; }
+                .dpgp-panel { color: var(--text-normal, #dbdee1); font-size: 14px; display: flex; flex-direction: column; gap: 10px; padding: 2px 2px 10px; }
                 .dpgp-panel .mono { font-family: var(--font-code, ui-monospace, "Cascadia Code", monospace); }
 
                 .dpgp-head {
-                    display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-radius: 10px;
-                    background: linear-gradient(135deg, rgba(88,101,242,.18), rgba(88,101,242,.04));
-                    border: 1px solid rgba(88,101,242,.35);
+                    display: flex; align-items: center; gap: 10px; padding: 8px 2px;
+                    border-bottom: 1px solid var(--background-modifier-accent, rgba(255,255,255,.08));
                 }
-                .dpgp-head-icon { font-size: 26px; }
-                .dpgp-head-title { font-weight: 700; font-size: 16px; color: var(--header-primary, #fff); }
+                .dpgp-head-title { font-weight: 600; font-size: 16px; color: var(--header-primary, #fff); }
                 .dpgp-head-sub { font-size: 12px; color: var(--text-muted, #949ba4); }
                 .dpgp-head .dpgp-pill { margin-left: auto; }
-                .dpgp-pill { font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 999px; white-space: nowrap; }
-                .dpgp-pill.ok { background: rgba(59,165,92,.18); color: #3ba55c; border: 1px solid rgba(59,165,92,.4); }
-                .dpgp-pill.warn { background: rgba(240,178,50,.15); color: #f0b232; border: 1px solid rgba(240,178,50,.4); }
+                .dpgp-pill { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+                .dpgp-pill.ok { color: #3ba55c; border: 1px solid rgba(59,165,92,.4); }
+                .dpgp-pill.warn { color: #f0b232; border: 1px solid rgba(240,178,50,.4); }
 
                 .dpgp-sec {
-                    border: 1px solid var(--background-modifier-accent, rgba(255,255,255,.08));
-                    border-radius: 10px; background: var(--background-secondary, rgba(0,0,0,.15)); overflow: hidden;
+                    border: 1px solid var(--background-modifier-accent, rgba(255,255,255,.07));
+                    border-radius: 6px; overflow: hidden;
                 }
-                .dpgp-sum { list-style: none; display: flex; align-items: center; gap: 10px; padding: 12px 14px; cursor: pointer; user-select: none; }
+                .dpgp-sum { list-style: none; display: flex; align-items: center; gap: 8px; padding: 10px 12px; cursor: pointer; user-select: none; }
                 .dpgp-sum::-webkit-details-marker { display: none; }
                 .dpgp-sum:hover { background: var(--background-modifier-hover, rgba(255,255,255,.03)); }
-                .dpgp-sum-icon { font-size: 18px; }
-                .dpgp-sum-title { font-weight: 600; color: var(--header-primary, #f2f3f5); }
+                .dpgp-sum-title { font-weight: 500; font-size: 14px; color: var(--header-primary, #f2f3f5); }
                 .dpgp-sum-sub { font-size: 12px; color: var(--text-muted, #949ba4); }
-                .dpgp-chev { margin-left: auto; color: var(--text-muted, #949ba4); font-size: 18px; transition: transform .15s ease; }
+                .dpgp-chev { margin-left: auto; color: var(--text-muted, #949ba4); font-size: 16px; transition: transform .15s ease; }
                 .dpgp-sec[open] > .dpgp-sum .dpgp-chev { transform: rotate(90deg); }
                 .dpgp-sec-body {
-                    display: flex; flex-direction: column; gap: 10px; padding: 12px 14px 14px;
-                    border-top: 1px solid var(--background-modifier-accent, rgba(255,255,255,.06));
+                    display: flex; flex-direction: column; gap: 9px; padding: 12px;
+                    border-top: 1px solid var(--background-modifier-accent, rgba(255,255,255,.05));
                 }
 
-                .dpgp-field { display: flex; flex-direction: column; gap: 5px; }
-                .dpgp-stack { display: flex; flex-direction: column; gap: 10px; }
-                .dpgp-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .02em; color: var(--header-secondary, #b5bac1); }
+                .dpgp-field { display: flex; flex-direction: column; gap: 4px; }
+                .dpgp-stack { display: flex; flex-direction: column; gap: 8px; }
+                .dpgp-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .02em; color: var(--header-secondary, #b5bac1); }
                 .dpgp-input {
                     width: 100%; box-sizing: border-box; background: var(--input-background, rgba(0,0,0,.3));
                     color: var(--text-normal, #dbdee1); border: 1px solid var(--background-tertiary, rgba(0,0,0,.3));
-                    border-radius: 6px; padding: 8px 10px; font-size: 13px; outline: none; transition: border-color .12s;
+                    border-radius: 4px; padding: 7px 9px; font-size: 13px; outline: none; transition: border-color .12s;
                 }
                 .dpgp-input:focus { border-color: var(--brand-experiment, #5865f2); }
-                textarea.dpgp-input { min-height: 88px; resize: vertical; font-size: 12px; }
+                textarea.dpgp-input { min-height: 80px; resize: vertical; font-size: 12px; }
                 select.dpgp-input { cursor: pointer; }
 
-                .dpgp-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-                .dpgp-grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-                .dpgp-passrow { display: flex; gap: 6px; }
+                .dpgp-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+                .dpgp-grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+                .dpgp-passrow { display: flex; gap: 5px; }
                 .dpgp-passrow .dpgp-input { flex: 1; }
 
                 .dpgp-btn {
-                    border: none; border-radius: 6px; padding: 8px 14px; font-size: 13px; font-weight: 500; cursor: pointer;
+                    border: none; border-radius: 4px; padding: 6px 12px; font-size: 13px; font-weight: 500; cursor: pointer;
                     background: var(--brand-experiment, #5865f2); color: #fff; transition: filter .12s, background .12s;
                 }
                 .dpgp-btn:hover { filter: brightness(1.1); }
@@ -671,47 +865,44 @@ module.exports = (() => {
                 .dpgp-btn.secondary { background: var(--background-modifier-accent, rgba(255,255,255,.09)); color: var(--text-normal, #dbdee1); }
                 .dpgp-btn.danger { background: transparent; color: var(--text-danger, #fa777c); border: 1px solid rgba(237,66,69,.5); }
                 .dpgp-btn.danger:hover { background: #ed4245; color: #fff; filter: none; }
-                .dpgp-btn.eye { padding: 8px 10px; flex: none; }
+                .dpgp-btn.eye { padding: 6px 9px; flex: none; font-size: 12px; }
 
                 .dpgp-kv {
-                    display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; padding: 10px 12px;
-                    border-radius: 8px; background: var(--background-tertiary, rgba(0,0,0,.2));
+                    display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; padding: 8px 10px;
+                    border-radius: 4px; background: var(--background-tertiary, rgba(0,0,0,.2));
                 }
                 .dpgp-kv-k { font-size: 12px; color: var(--text-muted, #949ba4); font-weight: 600; }
                 .dpgp-kv-v { font-size: 13px; word-break: break-all; }
 
-                .dpgp-seg { display: inline-flex; gap: 2px; background: var(--background-tertiary, rgba(0,0,0,.25)); border-radius: 8px; padding: 3px; width: max-content; }
+                .dpgp-seg { display: inline-flex; gap: 2px; background: var(--background-tertiary, rgba(0,0,0,.25)); border-radius: 4px; padding: 2px; width: max-content; }
                 .dpgp-seg > button {
                     border: none; background: transparent; color: var(--text-muted, #949ba4);
-                    font-size: 13px; font-weight: 600; padding: 6px 18px; border-radius: 6px; cursor: pointer; transition: background .12s, color .12s;
+                    font-size: 13px; font-weight: 500; padding: 5px 16px; border-radius: 3px; cursor: pointer; transition: background .12s, color .12s;
                 }
                 .dpgp-seg > button.active { background: var(--brand-experiment, #5865f2); color: #fff; }
 
-                .dpgp-contact { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 8px; background: var(--background-tertiary, rgba(0,0,0,.18)); }
-                .dpgp-avatar {
-                    width: 34px; height: 34px; border-radius: 50%; flex: none; display: flex; align-items: center; justify-content: center;
-                    font-weight: 700; color: #fff; background: var(--brand-experiment, #5865f2);
-                }
+                .dpgp-contact { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 4px; background: var(--background-tertiary, rgba(0,0,0,.18)); }
+                .dpgp-avatar { display: none; }
                 .dpgp-contact-info { min-width: 0; flex: 1; }
-                .dpgp-contact-name { font-weight: 600; }
+                .dpgp-contact-name { font-weight: 500; font-size: 13px; }
                 .dpgp-contact-meta { font-size: 11px; color: var(--text-muted, #949ba4); word-break: break-all; }
 
-                .dpgp-status { font-size: 12px; min-height: 15px; word-break: break-all; }
+                .dpgp-status { font-size: 12px; min-height: 14px; word-break: break-all; }
                 .dpgp-status.ok { color: #3ba55c; }
                 .dpgp-status.err { color: #ed4245; }
 
-                .dpgp-chanrow { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-radius: 8px; background: var(--background-tertiary, rgba(0,0,0,.18)); }
-                .dpgp-chanrow .name { flex: 1; word-break: break-all; }
+                .dpgp-chanrow { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 4px; background: var(--background-tertiary, rgba(0,0,0,.18)); }
+                .dpgp-chanrow .name { flex: 1; word-break: break-all; font-size: 13px; }
 
-                .dpgp-opt { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 4px 0; }
-                .dpgp-opt-title { font-weight: 500; }
+                .dpgp-opt { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 2px 0; }
+                .dpgp-opt-title { font-weight: 500; font-size: 13px; }
                 .dpgp-opt-sub { font-size: 12px; color: var(--text-muted, #949ba4); }
-                .dpgp-switch { position: relative; width: 40px; height: 24px; flex: none; }
+                .dpgp-switch { position: relative; width: 36px; height: 20px; flex: none; }
                 .dpgp-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
                 .dpgp-slider { position: absolute; inset: 0; border-radius: 999px; background: #80848e; transition: background .15s; cursor: pointer; }
                 .dpgp-slider::before {
-                    content: ""; position: absolute; width: 18px; height: 18px; border-radius: 50%;
-                    background: #fff; top: 3px; left: 3px; transition: transform .15s;
+                    content: ""; position: absolute; width: 16px; height: 16px; border-radius: 50%;
+                    background: #fff; top: 2px; left: 2px; transition: transform .15s;
                 }
                 .dpgp-switch input:checked + .dpgp-slider { background: #3ba55c; }
                 .dpgp-switch input:checked + .dpgp-slider::before { transform: translateX(16px); }
@@ -777,11 +968,10 @@ module.exports = (() => {
                 w.appendChild(node);
                 return w;
             };
-            const section = (icon, title, sub, open) => {
+            const section = (title, sub, open) => {
                 const d = el("details", "dpgp-sec");
                 if (open) d.open = true;
                 const sum = el("summary", "dpgp-sum");
-                sum.appendChild(el("span", "dpgp-sum-icon", { textContent: icon }));
                 const tw = el("div", "dpgp-sum-text");
                 tw.appendChild(el("div", "dpgp-sum-title", { textContent: title }));
                 if (sub) tw.appendChild(el("div", "dpgp-sum-sub", { textContent: sub }));
@@ -796,8 +986,10 @@ module.exports = (() => {
             const passInput = (placeholder, value) => {
                 const row = el("div", "dpgp-passrow");
                 const input = el("input", "dpgp-input", { type: "password", value: value || "", placeholder });
-                const eye = btn("👁", "secondary eye", () => {
-                    input.type = input.type === "password" ? "text" : "password";
+                const eye = btn("show", "secondary eye", () => {
+                    const hidden = input.type === "password";
+                    input.type = hidden ? "text" : "password";
+                    eye.textContent = hidden ? "hide" : "show";
                 });
                 row.appendChild(input);
                 row.appendChild(eye);
@@ -806,16 +998,15 @@ module.exports = (() => {
 
             // ===== header =====
             const head = el("div", "dpgp-head");
-            head.appendChild(el("div", "dpgp-head-icon", { textContent: "🔐" }));
             const ht = el("div", "dpgp-head-text");
             ht.appendChild(el("div", "dpgp-head-title", { textContent: "DiscordPG" }));
-            ht.appendChild(el("div", "dpgp-head-sub", { textContent: "End-to-end PGP encryption · v" + config.version }));
+            ht.appendChild(el("div", "dpgp-head-sub", { textContent: "end-to-end PGP · v" + config.version }));
             head.appendChild(ht);
             head.appendChild(el("span", "dpgp-pill " + (hasKey ? "ok" : "warn"), { textContent: hasKey ? "Key configured" : "No key yet" }));
             panel.appendChild(head);
 
             // ===== my identity =====
-            const idBody = section("🪪", "My identity",
+            const idBody = section("My identity",
                 hasKey ? "Your keypair — share the public half" : "Generate a key below, or import an existing one",
                 true);
 
@@ -844,14 +1035,14 @@ module.exports = (() => {
             }
 
             const idRow = el("div", "dpgp-row");
-            const copyBtn = btn("📋 Copy public key", "", () => this._copy(s.publicKey, "Public key"));
+            const copyBtn = btn("Copy public key", "", () => this._copy(s.publicKey, "Public key"));
             if (!s.publicKey) copyBtn.disabled = true;
             idRow.appendChild(copyBtn);
             if (hasKey) {
-                idRow.appendChild(btn("✏️ Edit / import keys", "secondary", () => {
+                idRow.appendChild(btn("Edit / import keys", "secondary", () => {
                     rawWrap.style.display = rawWrap.style.display === "none" ? "" : "none";
                 }));
-                idRow.appendChild(btn("🗑 Delete keypair", "danger", () => this._confirm(
+                idRow.appendChild(btn("Delete keypair", "danger", () => this._confirm(
                     "Delete keypair?",
                     "This removes your keys and passphrase from this machine. Messages encrypted to this key become unreadable unless you have a backup.",
                     "Delete",
@@ -872,7 +1063,7 @@ module.exports = (() => {
             rawWrap.appendChild(labeled("Private key (armored)", priv));
             rawWrap.appendChild(labeled("Passphrase", myPass.row));
             const saveRow = el("div", "dpgp-row");
-            saveRow.appendChild(btn("💾 Save keys", "", () => {
+            saveRow.appendChild(btn("Save keys", "", () => {
                 s.publicKey = pub.value.trim();
                 s.privateKey = priv.value.trim();
                 s.passphrase = myPass.input.value;
@@ -885,7 +1076,7 @@ module.exports = (() => {
             idBody.appendChild(rawWrap);
 
             // ===== generate =====
-            const genBody = section("✨", "Generate a new keypair", "ECC (recommended) or RSA — output is armored", !hasKey);
+            const genBody = section("Generate a new keypair", "ECC (recommended) or RSA — output is armored", !hasKey);
 
             const nameGrid = el("div", "dpgp-grid2");
             const genName = el("input", "dpgp-input", { type: "text", placeholder: "Alice (optional)" });
@@ -931,7 +1122,7 @@ module.exports = (() => {
             bRsa.onclick = () => setAlgo("rsa");
             setAlgo("ecc");
 
-            const genBtn = btn("✨ Generate keypair", "", async () => {
+            const genBtn = btn("Generate keypair", "", async () => {
                 if (!this.openpgp) return BdApi.UI.showToast("OpenPGP not loaded yet", { type: "error" });
                 genBtn.disabled = true;
                 genBtn.textContent = algoType === "rsa" ? "Generating… (RSA can take a moment)" : "Generating…";
@@ -964,14 +1155,14 @@ module.exports = (() => {
                 } catch (e) {
                     BdApi.UI.showToast("Generate failed: " + e.message, { type: "error" });
                     genBtn.disabled = false;
-                    genBtn.textContent = "✨ Generate keypair";
+                    genBtn.textContent = "Generate keypair";
                 }
             });
             genBody.appendChild(genBtn);
 
             // ===== contacts =====
             const contactIds = Object.keys(s.contacts);
-            const conBody = section("👥", "Contacts",
+            const conBody = section("Contacts",
                 contactIds.length ? contactIds.length + " public key" + (contactIds.length === 1 ? "" : "s") + " stored" : "Add your friends' public keys",
                 hasKey && !contactIds.length);
 
@@ -982,7 +1173,7 @@ module.exports = (() => {
             const cId = el("input", "dpgp-input mono", { type: "text", placeholder: "blank = resolve from username" });
             const cKey = el("textarea", "dpgp-input mono", { spellcheck: false, placeholder: "-----BEGIN PGP PUBLIC KEY BLOCK-----" });
             const status = el("div", "dpgp-status");
-            const addBtn = btn("➕ Add contact", "", async () => {
+            const addBtn = btn("Add contact", "", async () => {
                 let id = cId.value.trim();
                 const label = cLabel.value.trim();
                 const key = cKey.value.trim();
@@ -1021,7 +1212,7 @@ module.exports = (() => {
                 cLabel.value = cId.value = cKey.value = "";
                 status.textContent = "";
                 status.className = "dpgp-status";
-                addBtn.textContent = "➕ Add contact";
+                addBtn.textContent = "Add contact";
                 cancelBtn.style.display = "none";
             });
             cancelBtn.style.display = "none";
@@ -1033,7 +1224,6 @@ module.exports = (() => {
             for (const id of contactIds) {
                 const c = s.contacts[id];
                 const card = el("div", "dpgp-contact");
-                card.appendChild(el("div", "dpgp-avatar", { textContent: (c.label || "?").charAt(0).toUpperCase() }));
                 const info = el("div", "dpgp-contact-info");
                 info.appendChild(el("div", "dpgp-contact-name", { textContent: c.label || "Unnamed contact" }));
                 const idText = id.startsWith("name:") ? "ID pending — matches by username" : "ID " + id;
@@ -1045,17 +1235,17 @@ module.exports = (() => {
                         .then((i) => { meta.textContent = idText + "  ·  " + i.algo + "  ·  " + i.fingerprint; })
                         .catch(() => { meta.textContent = idText + "  ·  ⚠ unreadable key"; });
                 }
-                card.appendChild(btn("✏️", "secondary eye", () => {
+                card.appendChild(btn("Edit", "secondary eye", () => {
                     editingId = id;
                     cLabel.value = c.label || "";
                     cId.value = id.startsWith("name:") ? "" : id;
                     cKey.value = c.publicKey || "";
                     cKey.oninput(); // refresh the live key-validation line
-                    addBtn.textContent = "💾 Save changes";
+                    addBtn.textContent = "Save changes";
                     cancelBtn.style.display = "";
                     if (cLabel.scrollIntoView) cLabel.scrollIntoView({ behavior: "smooth", block: "center" });
                 }));
-                card.appendChild(btn("📋", "secondary eye", () => this._copy(c.publicKey, "Contact's public key")));
+                card.appendChild(btn("Copy", "secondary eye", () => this._copy(c.publicKey, "Contact's public key")));
                 card.appendChild(btn("Remove", "danger", () => {
                     delete s.contacts[id];
                     this.save();
@@ -1090,7 +1280,7 @@ module.exports = (() => {
 
             // ===== encrypted channels =====
             const chanIds = Object.keys(s.enabledChannels);
-            const chBody = section("💬", "Encrypted channels", chanIds.length ? chanIds.length + " enabled" : "None enabled", false);
+            const chBody = section("Encrypted channels", chanIds.length ? chanIds.length + " enabled" : "None enabled", false);
             if (!chanIds.length) {
                 chBody.appendChild(el("div", "dpgp-muted", { textContent:
                     "Type  /pgp on  in any channel to start encrypting it. It will show up here." }));
@@ -1099,7 +1289,7 @@ module.exports = (() => {
                 const ch = this.ChannelStore && this.ChannelStore.getChannel(id);
                 const name = ch ? (ch.name ? "#" + ch.name : "Direct message · " + id) : "Channel " + id;
                 const row = el("div", "dpgp-chanrow");
-                row.appendChild(el("div", "name", { textContent: "🔒 " + name }));
+                row.appendChild(el("div", "name", { textContent: name }));
                 row.appendChild(btn("Disable", "secondary", () => {
                     delete s.enabledChannels[id];
                     this.save();
@@ -1110,7 +1300,7 @@ module.exports = (() => {
             }
 
             // ===== options =====
-            const optBody = section("⚙️", "Options", "Signing & decryption behaviour", false);
+            const optBody = section("Options", "Signing & decryption behaviour", false);
             const mkSwitch = (key, title, sub) => {
                 const row = el("div", "dpgp-opt");
                 const tw = el("div");
@@ -1126,7 +1316,11 @@ module.exports = (() => {
                 optBody.appendChild(row);
             };
             mkSwitch("signMessages", "Sign outgoing messages", "Lets recipients holding your public key verify it was really you");
-            mkSwitch("autoDecrypt", "Auto-decrypt incoming messages", "Replaces PGP blocks in chat with the decrypted text and a 🔓 badge");
+            mkSwitch("autoDecrypt", "Auto-decrypt incoming messages", "Replaces PGP blocks in chat with the decrypted text and a badge");
+            mkSwitch("minimalBadges", "Minimal encryption signs", "Just a plain lock icon on messages — no color, no PGP text");
+            mkSwitch("richContent", "Rich content in decrypted messages (opt-in)", "Render emojis, clickable links, and media in decrypted text. Off = plain text only, nothing is ever fetched");
+            mkSwitch("renderEmojis", "└ Render custom emojis", "Shows <:emoji:> images — fetched from Discord's CDN. Needs rich content on");
+            mkSwitch("autoLoadMedia", "└ Auto-load images & GIFs (opsec risk)", "Fetches linked media without asking — reveals your IP and read-time to the host. Off = click-to-load button. Needs rich content on");
 
             panel.appendChild(el("div", "dpgp-foot", { textContent:
                 "Commands: /pgp on · /pgp off · /pgp status — keys are stored unencrypted on this machine." }));
