@@ -1,6 +1,6 @@
-# DiscordPG
+# DiscordPG — Discord Privacy Guard
 
-A [BetterDiscord](https://betterdiscord.app/) plugin that provides end-to-end PGP encryption for Discord messages, built on [OpenPGP.js](https://openpgpjs.org/). All keys and messages use standard ASCII-armored OpenPGP formats and are fully interoperable with GnuPG and any other OpenPGP implementation.
+**DiscordPG (Discord Privacy Guard)** is a [BetterDiscord](https://betterdiscord.app/) plugin that provides end-to-end PGP encryption for Discord messages, built on [OpenPGP.js](https://openpgpjs.org/). All keys and messages use standard ASCII-armored OpenPGP formats and are fully interoperable with GnuPG and any other OpenPGP implementation.
 
 > This is a community project, not a professionally audited security product.
 > Read the [Security](#security) section before relying on it. Your private key
@@ -105,7 +105,7 @@ Key distribution is **trust-on-first-use**: there is no key server and no certif
 **Other notes**
 
 - Rich content is off by default: loading remote media in a decrypted message discloses your IP and read time to the media host, and a unique URL can identify you. When on, media is click-to-load and each button names the host.
-- OpenPGP.js is downloaded once from jsDelivr on first run; review the source and pin or verify the library yourself if your threat model requires it.
+- OpenPGP.js is downloaded once from jsDelivr on first run. The plugin pins an exact library version and verifies the download against a hard-coded SHA-256 before executing it — and re-verifies the on-disk copy on every load — so a compromised CDN, package, or tampered cache file cannot run code in your client. Remote media (when rich content is enabled) is fetched with a size cap and a timeout, and will not follow a redirect to a different host than the one shown on the "Load media" button.
 - Client modifications are against Discord's Terms of Service. Use at your own discretion.
 
 ## Limitations

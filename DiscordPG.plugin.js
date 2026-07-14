@@ -2,7 +2,7 @@
  * @name DiscordPG
  * @author topklc
  * @authorId 0
- * @version 1.25.0
+ * @version 1.26.0
  * @description End-to-end PGP encryption for Discord, built on OpenPGP.js. Generate ECC or RSA keys, encrypt to per-channel groups or specific @mentioned contacts, and auto-decrypt and signature-verify incoming messages inline. Includes a contact keyring, key revocation, and /pgp slash commands.
  * @website https://github.com/topklc/DiscordPG
  * @source https://github.com/topklc/DiscordPG/blob/main/DiscordPG.plugin.js
@@ -34,16 +34,26 @@ module.exports = (() => {
 
     const config = {
         name: "DiscordPG",
-        version: "1.25.0",
+        version: "1.26.0",
         author: "topklc",
     };
 
-    // OpenPGP.js v5 UMD build. "@5" resolves to the latest v5.x on jsDelivr.
-    const OPENPGP_URL = "https://cdn.jsdelivr.net/npm/openpgp@5/dist/openpgp.min.js";
+    // OpenPGP.js v5 UMD build, pinned to an EXACT version (never a floating "@5"
+    // tag) so the bytes we execute are fixed and can be hash-verified.
+    const OPENPGP_VERSION = "5.11.3";
+    const OPENPGP_URL = "https://cdn.jsdelivr.net/npm/openpgp@" + OPENPGP_VERSION + "/dist/openpgp.min.js";
+    // SHA-256 of the exact pinned bundle above. Both the fresh download AND every
+    // load from the on-disk cache are verified against this before the code runs.
+    // The library is executed with full Node access (fs/https/electron) inside
+    // Discord's renderer, so a compromised CDN/npm package, or anything that can
+    // write the cache file, must NOT be able to run arbitrary code. Update this in
+    // lockstep with OPENPGP_VERSION (recompute with: sha256sum openpgp.min.js).
+    const OPENPGP_SHA256 = "89ae4b15e830e08096a125003218bdc7b5c39a4075437dc8d6d4a4e3bdc9a550";
 
     const path = require("path");
     const fs = require("fs");
     const https = require("https");
+    const crypto = require("crypto");
 
     const DEFAULTS = {
         privateKey: "",
@@ -77,6 +87,7 @@ module.exports = (() => {
             this.settings = Object.assign({}, DEFAULTS, { contacts: {}, enabledChannels: {}, groups: {} });
             this.openpgp = null;
             this.decryptCache = new Map();  // armoredCiphertext -> { ok: boolean, text: string }
+            this.revocationCache = new Map(); // armored key/cert -> match result (bounds repost-flood work)
             this.myUnlockedKey = null;      // cached unlocked private key object (memory only)
             this.sessionPassphrase = null;  // passphrase held for this session, never written to disk
             this._unlockPromise = null;     // in-flight passphrase prompt (serializes concurrent unlocks)
@@ -123,6 +134,11 @@ module.exports = (() => {
         }
         save() {
             BdApi.Data.save(config.name, "settings", this.settings);
+            // Revocation matches depend on the stored keys/contacts, so drop the
+            // match cache on every settings write. Keyring changes always go through
+            // save(); incoming-message floods never do, so the flood protection the
+            // cache provides is unaffected.
+            if (this.revocationCache) this.revocationCache.clear();
         }
 
         // ---------- lifecycle ----------
@@ -151,6 +167,7 @@ module.exports = (() => {
             this.myUnlockedKey = null; this.sessionPassphrase = null;
             this._unlockPromise = null; this._unlockDismissed = false;
             this.decryptCache.clear();
+            this.revocationCache.clear();
         }
 
         async _init() {
@@ -184,42 +201,61 @@ module.exports = (() => {
             BdApi.UI.showToast("DiscordPG ready", { type: "success" });
         }
 
+        _sha256(buf) {
+            return crypto.createHash("sha256").update(buf).digest("hex");
+        }
+
         // ---------- OpenPGP loading ----------
         async _loadOpenPGP() {
             const dir = BdApi.Plugins.folder;
             const libPath = path.join(dir, ".openpgp.min.js");
-            if (!fs.existsSync(libPath) || fs.statSync(libPath).size < 10000) {
-                BdApi.UI.showToast("DiscordPG: downloading OpenPGP.js…", { type: "info" });
-                await this._download(OPENPGP_URL, libPath);
-                // The self-contained browser build leaves its API in a module-local
-                // `var openpgp` that never reaches module.exports when require()'d.
-                // Append an export line so a real CommonJS loader can pick it up.
-                // Best-effort only; the evaluation fallback below doesn't need it,
-                // and some fs shims lack appendFileSync.
+
+            // Use the on-disk cache only if its bytes match the pinned hash. Any
+            // mismatch (tampering, corruption, an old/other version) is treated as
+            // no cache: the file is deleted and re-downloaded. The stored file is
+            // the pristine, verified bundle — we deliberately do NOT append an
+            // export line to it, which would change the bytes and break this check.
+            let code = null;
+            if (fs.existsSync(libPath)) {
                 try {
-                    fs.appendFileSync(
-                        libPath,
-                        '\n;if(typeof module!=="undefined"&&module.exports){module.exports=openpgp;}\n'
-                    );
-                } catch (_) { /* eval path works without it */ }
+                    const cached = fs.readFileSync(libPath);
+                    if (this._sha256(cached) === OPENPGP_SHA256) code = cached.toString("utf8");
+                    else { try { fs.unlinkSync(libPath); } catch (_) {} }
+                } catch (_) { /* unreadable cache: fall through to re-download */ }
             }
+
+            if (code == null) {
+                BdApi.UI.showToast("DiscordPG: downloading OpenPGP.js…", { type: "info" });
+                const buf = await this._fetchBuffer(OPENPGP_URL);
+                if (!buf || buf.length < 10000) throw new Error("Downloaded OpenPGP.js looks too small/empty.");
+                // Verify BEFORE writing or executing: a bundle that fails the
+                // integrity check is never persisted and never run.
+                const digest = this._sha256(buf);
+                if (digest !== OPENPGP_SHA256) {
+                    throw new Error("OpenPGP.js failed its integrity check (expected "
+                        + OPENPGP_SHA256.slice(0, 12) + "…, got " + digest.slice(0, 12) + "…)."
+                        + " Refusing to load; nothing was written to disk.");
+                }
+                fs.writeFileSync(libPath, buf);
+                code = buf.toString("utf8");
+            }
+
             let openpgp = null;
 
             // Attempt 1: CommonJS require (works when a real Node loader is present).
             // BetterDiscord's require shim can't load arbitrary files, so it may return
-            // an empty object or throw, so treat failure as non-fatal.
+            // an empty object or throw; treat failure as non-fatal. The file it reads
+            // is the same hash-verified bundle we just validated.
             try {
                 if (require.cache && require.resolve) delete require.cache[require.resolve(libPath)];
                 openpgp = require(libPath);
             } catch (_) { /* fall through to evaluation */ }
 
-            // Attempt 2: evaluate the bundle text in a function scope and capture
-            // its top-level `var openpgp`. This works inside Discord's renderer.
-            // A truncated/HTML/otherwise-corrupt cache passes the size gate above
-            // but makes new Function throw a SyntaxError, so catch it here.
+            // Attempt 2: evaluate the verified bundle text in a function scope and
+            // capture its top-level `var openpgp`. This works inside Discord's
+            // renderer where require() of a browser build yields nothing useful.
             if (!openpgp || typeof openpgp.encrypt !== "function") {
                 try {
-                    const code = fs.readFileSync(libPath, "utf8");
                     openpgp = new Function(
                         code + '\n;return (typeof openpgp !== "undefined") ? openpgp : undefined;'
                     )();
@@ -227,18 +263,13 @@ module.exports = (() => {
             }
 
             if (!openpgp || typeof openpgp.encrypt !== "function") {
-                // Delete the bad cache so the NEXT start re-downloads instead of
-                // being permanently bricked by a corrupt >10KB file.
+                // The bytes matched the pinned hash but still didn't yield a usable
+                // API (broken eval environment). Drop the cache so a later start
+                // retries instead of failing forever.
                 try { fs.unlinkSync(libPath); } catch (_) {}
-                throw new Error("OpenPGP.js cache was invalid; deleted it. Reload the plugin to re-download.");
+                throw new Error("OpenPGP.js loaded but exposed no usable API. Cache cleared; reload the plugin.");
             }
             return openpgp;
-        }
-
-        async _download(url, dest) {
-            const buf = await this._fetchBuffer(url);
-            if (!buf || buf.length < 10000) throw new Error("Downloaded file looks too small/empty.");
-            fs.writeFileSync(dest, buf);
         }
 
         // Try several download mechanisms in order of reliability inside Discord's
@@ -271,10 +302,27 @@ module.exports = (() => {
             throw new Error("all download methods failed [" + errors.join(" | ") + "]");
         }
 
-        _httpsGet(url, redirects = 0) {
+        // GET a URL over Node https, returning a Buffer. Options:
+        //   maxBytes     - abort (fail) once the body exceeds this many bytes,
+        //                  enforced WHILE streaming (and pre-checked against
+        //                  Content-Length) so a huge/endless response can't
+        //                  exhaust memory. 0 = unlimited.
+        //   timeoutMs    - abort if the whole request doesn't finish in time.
+        //   restrictHost - if set, a redirect to any other hostname is refused
+        //                  (keeps a "trust host X" decision from silently
+        //                  following a 30x to an attacker-controlled host).
+        _httpsGet(url, opts = {}) {
+            const { maxBytes = 0, timeoutMs = 30000, restrictHost = null, _redirects = 0 } = opts;
             return new Promise((resolve, reject) => {
-                if (redirects > 5) return reject(new Error("too many redirects"));
-                let req;
+                if (_redirects > 5) return reject(new Error("too many redirects"));
+                let settled = false, req = null, timer = null;
+                const done = (fn, v) => {
+                    if (settled) return; settled = true;
+                    if (timer) clearTimeout(timer);
+                    fn(v);
+                };
+                const fail = (e) => { try { if (req && req.destroy) req.destroy(); } catch (_) {} done(reject, e); };
+                timer = setTimeout(() => fail(new Error("request timed out")), timeoutMs);
                 try {
                     req = https.get(url, (res) => {
                         const status = res.statusCode;
@@ -282,19 +330,33 @@ module.exports = (() => {
                         if (status >= 300 && status < 400 && res.headers && res.headers.location) {
                             drain();
                             const next = new URL(res.headers.location, url).toString();
-                            return resolve(this._httpsGet(next, redirects + 1));
+                            if (restrictHost) {
+                                let h = ""; try { h = new URL(next).hostname; } catch (_) {}
+                                if (h !== restrictHost) return fail(new Error("blocked redirect to a different host (" + (h || "?") + ")"));
+                            }
+                            if (timer) clearTimeout(timer);
+                            settled = true; // this promise now defers to the followed redirect
+                            return resolve(this._httpsGet(next, Object.assign({}, opts, { _redirects: _redirects + 1 })));
                         }
-                        if (status !== 200) {
-                            drain();
-                            return reject(new Error("HTTP " + status));
+                        if (status !== 200) { drain(); return fail(new Error("HTTP " + status)); }
+                        if (maxBytes) {
+                            const len = parseInt((res.headers && res.headers["content-length"]) || "", 10);
+                            if (len && len > maxBytes) { drain(); return fail(new Error("response too large (>" + maxBytes + " bytes)")); }
                         }
                         const chunks = [];
-                        res.on("data", (c) => chunks.push(Buffer.from(c)));
-                        res.on("end", () => resolve(Buffer.concat(chunks)));
-                        res.on("error", reject);
+                        let total = 0;
+                        res.on("data", (c) => {
+                            if (settled) return;
+                            const b = Buffer.from(c);
+                            total += b.length;
+                            if (maxBytes && total > maxBytes) return fail(new Error("response too large (>" + maxBytes + " bytes)"));
+                            chunks.push(b);
+                        });
+                        res.on("end", () => done(resolve, Buffer.concat(chunks)));
+                        res.on("error", fail);
                     });
-                } catch (e) { return reject(e); }
-                if (req && typeof req.on === "function") req.on("error", reject);
+                } catch (e) { return fail(e); }
+                if (req && typeof req.on === "function") req.on("error", fail);
             });
         }
 
@@ -707,13 +769,39 @@ module.exports = (() => {
         // saved under multiple contacts is fully revoked, not just the first.
         // The message author is never trusted; only the signature decides.
         async _matchRevocation(armored) {
-            const cands = [];
-            if (this.settings.publicKey) cands.push({ self: true, key: this.settings.publicKey });
+            // Cache by the exact armored text: verifying a detached certificate
+            // means one signature check per stored key, so a channel flooded with
+            // reposts of the same cert would otherwise redo that work on every
+            // message. Bounded so it can't grow without limit.
+            if (this.revocationCache.has(armored)) return this.revocationCache.get(armored);
+            const result = await this._computeRevocation(armored);
+            this.revocationCache.set(armored, result);
+            while (this.revocationCache.size > 100) {
+                this.revocationCache.delete(this.revocationCache.keys().next().value);
+            }
+            return result;
+        }
+
+        async _computeRevocation(armored) {
+            // Group candidates by their armored key so an identical key saved under
+            // several contacts (or as both self and a contact) is verified ONCE and
+            // then expanded back to every holder, instead of re-running the check.
+            const byKey = new Map(); // armoredKey -> { self, ids: [] }
+            const add = (key, self, id) => {
+                let e = byKey.get(key);
+                if (!e) { e = { self: false, ids: [] }; byKey.set(key, e); }
+                if (self) e.self = true;
+                if (id) e.ids.push(id);
+            };
+            if (this.settings.publicKey) add(this.settings.publicKey, true, null);
             for (const [id, c] of Object.entries(this.settings.contacts)) {
-                if (c.publicKey) cands.push({ id, key: c.publicKey });
+                if (c.publicKey) add(c.publicKey, false, id);
             }
 
-            const matched = [];
+            let matchedSelf = false;
+            const matchedIds = [];
+            const expand = (entry) => { if (entry.self) matchedSelf = true; for (const id of entry.ids) matchedIds.push(id); };
+
             // Form A: a full key block that is already revoked. isRevoked() has
             // verified the embedded self-signature, so a fingerprint match is safe.
             let parsed = null;
@@ -721,28 +809,25 @@ module.exports = (() => {
             if (parsed) {
                 if (!(await parsed.isRevoked())) return null; // a normal, live key
                 const fpr = parsed.getFingerprint();
-                for (const cand of cands) {
-                    if ((await this._fprOf(cand.key)) === fpr) matched.push(cand);
+                for (const [key, entry] of byKey) {
+                    if ((await this._fprOf(key)) === fpr) expand(entry);
                 }
             } else {
                 // Form B: a detached revocation certificate. revokeKey() throws
                 // unless the certificate's signature matches the candidate key.
-                for (const cand of cands) {
+                for (const [key, entry] of byKey) {
                     try {
                         const revoked = await this.openpgp.revokeKey({
-                            key: await this.openpgp.readKey({ armoredKey: cand.key }),
+                            key: await this.openpgp.readKey({ armoredKey: key }),
                             revocationCertificate: armored,
                             format: "armored",
                         });
-                        if (await (await this.openpgp.readKey({ armoredKey: revoked.publicKey })).isRevoked()) matched.push(cand);
+                        if (await (await this.openpgp.readKey({ armoredKey: revoked.publicKey })).isRevoked()) expand(entry);
                     } catch (_) { /* signature does not match this candidate */ }
                 }
             }
-            if (!matched.length) return null;
-            return {
-                self: matched.some((m) => m.self),
-                contacts: matched.filter((m) => m.id).map((m) => m.id),
-            };
+            if (!matchedSelf && !matchedIds.length) return null;
+            return { self: matchedSelf, contacts: matchedIds };
         }
 
         // ---------- sending ----------
@@ -1517,9 +1602,13 @@ module.exports = (() => {
         // Fetch remote media over Node and return it as a data: URL, bypassing the
         // renderer's img-src CSP. Sniffs the type from magic bytes; caps size.
         async _fetchDataUrl(url) {
-            const buf = await this._httpsGet(url);
+            // Pin the fetch to the URL's own host: the "reveals your IP to <host>"
+            // prompt named that host, so a 30x to somewhere else (an IP logger the
+            // sender controls) must not be silently followed. The 25 MB cap and a
+            // timeout are enforced during streaming, not after the body is buffered.
+            let host = ""; try { host = new URL(url).hostname; } catch (_) {}
+            const buf = await this._httpsGet(url, { maxBytes: 26214400, timeoutMs: 20000, restrictHost: host });
             if (!buf || !buf.length) throw new Error("empty response");
-            if (buf.length > 26214400) throw new Error("media too large (>25 MB)");
             const mime = this._sniffMime(buf);
             if (!mime) throw new Error("not a recognized image");
             return "data:" + mime + ";base64," + buf.toString("base64");
@@ -2181,7 +2270,12 @@ module.exports = (() => {
 
             const pub = el("textarea", "dpgp-input mono", { value: s.publicKey, spellcheck: false, placeholder: "-----BEGIN PGP PUBLIC KEY BLOCK-----" });
             const priv = el("textarea", "dpgp-input mono", { value: s.privateKey, spellcheck: false, placeholder: "-----BEGIN PGP PRIVATE KEY BLOCK-----" });
-            const myPass = passInput("Optional", s.rememberPassphrase ? s.passphrase : (this.sessionPassphrase || ""));
+            // Left blank on open so the cleartext passphrase isn't parked in a DOM
+            // node (readable via the "Show" toggle) every time settings are open.
+            // A blank field on Save keeps the passphrase already held (see below);
+            // typing here sets or changes it.
+            const hasPass = !!(s.rememberPassphrase ? s.passphrase : (this.sessionPassphrase || s.passphrase));
+            const myPass = passInput(hasPass ? "Unchanged — type to replace" : "Optional", "");
             rawWrap.appendChild(labeled("Public key", pub));
             rawWrap.appendChild(labeled("Private key", priv));
             // Revocation certificate sits between the private key and passphrase.
@@ -2237,11 +2331,19 @@ module.exports = (() => {
             const saveRow = el("div", "dpgp-row");
             saveRow.appendChild(btn("Save keys", "", () => {
                 const newPriv = priv.value.trim();
+                const keyChanged = newPriv !== s.privateKey;
                 // A pasted/changed private key invalidates any cached revocation cert.
-                if (newPriv !== s.privateKey) s.revocationCertificate = "";
+                if (keyChanged) s.revocationCertificate = "";
                 s.publicKey = pub.value.trim();
                 s.privateKey = newPriv;
-                const pass = myPass.input.value;
+                // The passphrase field starts blank (it isn't pre-filled with the
+                // secret). Resolve what to use:
+                //   typed         -> set/replace with it
+                //   blank + same key   -> keep the passphrase we already hold
+                //   blank + new key    -> treat the new key as having no passphrase
+                const typed = myPass.input.value;
+                const held = this.sessionPassphrase != null ? this.sessionPassphrase : (s.passphrase || "");
+                const pass = typed ? typed : (keyChanged ? "" : held);
                 // Reset unlock state for the new key, then keep the passphrase in
                 // memory (or on disk only if "remember" is on).
                 this._forgetUnlock();
